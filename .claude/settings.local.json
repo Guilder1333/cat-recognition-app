@@ -9,7 +9,8 @@
       "Bash(powershell -Command \"Expand-Archive -Path detect.zip -DestinationPath . -Force\")",
       "Bash(del:*)",
       "Bash(./gradlew assembleDebug:*)",
-      "Bash(./gradlew installDebug:*)"
+      "Bash(./gradlew installDebug:*)",
+      "Bash(./gradlew:*)"
     ]
   }
 }

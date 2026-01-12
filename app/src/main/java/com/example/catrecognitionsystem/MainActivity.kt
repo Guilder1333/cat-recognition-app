@@ -21,6 +21,7 @@ import com.example.catrecognitionsystem.camera.CameraManager
 import com.example.catrecognitionsystem.ml.CatDetector
 import com.example.catrecognitionsystem.ui.CatDetectionScreen
 import com.example.catrecognitionsystem.ui.theme.CatRecognitionSystemTheme
+import org.opencv.android.OpenCVLoader
 
 class MainActivity : ComponentActivity() {
 
@@ -44,6 +45,18 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        // Initialize OpenCV
+        if (!OpenCVLoader.initDebug()) {
+            android.util.Log.e("MainActivity", "OpenCV initialization failed")
+            Toast.makeText(
+                this,
+                "OpenCV initialization failed. Tracking will not be available.",
+                Toast.LENGTH_LONG
+            ).show()
+        } else {
+            android.util.Log.d("MainActivity", "OpenCV initialized successfully")
+        }
 
         // Initialize camera manager and cat detector
         cameraManager = CameraManager(this)

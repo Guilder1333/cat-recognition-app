@@ -41,3 +41,9 @@ replay_pid*
 .externalNativeBuild
 .cxx
 local.properties
+
+# Third-party libraries (downloaded by setup scripts)
+/opencv/
+/third_party/
+
+/tmpclaude-*

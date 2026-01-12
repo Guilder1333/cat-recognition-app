@@ -23,7 +23,7 @@ class CatDetector(context: Context) {
         private const val MODEL_FILE = "detect.tflite"
         private const val LABELS_FILE = "labelmap.txt"
         private const val INPUT_SIZE = 300
-        private const val CONFIDENCE_THRESHOLD = 0.4f  // Balanced threshold
+        private const val CONFIDENCE_THRESHOLD = 0.1f  // Very low threshold for debugging
         private const val MAX_DETECTIONS = 10
         private const val DEFAULT_CAT_INDEX = 17 // Default cat index in COCO
 
@@ -137,6 +137,11 @@ class CatDetector(context: Context) {
             // Run inference
             interpreter?.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputs)
 
+            // Log raw output info for debugging
+            Log.d(TAG, "Model inference completed. Detection count: ${outputCount[0]}")
+            Log.d(TAG, "First 3 scores: ${outputScores[0].take(3).joinToString()}")
+            Log.d(TAG, "First 3 classes: ${outputClasses[0].take(3).joinToString()}")
+
             // Parse results and filter for cats, using original bitmap for color analysis
             return parseDetections(
                 originalBitmap,
@@ -220,6 +225,19 @@ class CatDetector(context: Context) {
         val detections = mutableListOf<DetectionResult>()
         val validDetections = min(numDetections, MAX_DETECTIONS)
 
+        // Find max score for debugging
+        val maxScore = scores.take(validDetections).maxOrNull() ?: 0f
+        Log.d(TAG, "Processing $validDetections detections, looking for cat at index $catClassIndex")
+        Log.d(TAG, "Max confidence score found: $maxScore")
+
+        // Log ALL detections to see what's happening
+        for (i in 0 until validDetections) {
+            val score = scores[i]
+            val classIndex = classes[i].toInt()
+            val className = labels.getOrElse(classIndex) { "unknown-$classIndex" }
+            Log.d(TAG, "Detection $i: class=$classIndex ($className), confidence=$score")
+        }
+
         for (i in 0 until validDetections) {
             val score = scores[i]
             val classIndex = classes[i].toInt()
@@ -230,9 +248,16 @@ class CatDetector(context: Context) {
             }
 
             // Filter for cat class only
-            if (classIndex != catClassIndex) {
+            // Handle both 0-indexed and potential off-by-one issues
+            val isCat = classIndex == catClassIndex ||
+                        classIndex == catClassIndex + 1 ||
+                        classIndex == catClassIndex - 1
+
+            if (!isCat) {
                 continue
             }
+
+            Log.d(TAG, "Cat detected! classIndex=$classIndex, confidence=$score")
 
             // Extract bounding box coordinates
             // Output format: [top, left, bottom, right] in normalized coordinates [0, 1]
