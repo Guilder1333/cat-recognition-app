@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(curl:*)",
+      "Bash(tar:*)",
+      "Bash(powershell -Command \"Expand-Archive -Path detect.tflite -DestinationPath . -Force\")",
+      "Bash(ren:*)",
+      "Bash(powershell -Command \"Expand-Archive -Path detect.zip -DestinationPath . -Force\")",
+      "Bash(del:*)",
+      "Bash(./gradlew assembleDebug:*)",
+      "Bash(./gradlew installDebug:*)"
+    ]
+  }
+}
