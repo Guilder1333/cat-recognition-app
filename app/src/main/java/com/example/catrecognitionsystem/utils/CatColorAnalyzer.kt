@@ -39,12 +39,33 @@ object CatColorAnalyzer {
                 return CatColor.UNKNOWN
             }
 
-            // Sample pixels from the bounding box region
-            val samples = mutableListOf<Int>()
-            val step = max(1, min(width, height) / 20) // Sample ~400 pixels
+            // Create an inner region (60% of the bounding box) to avoid sampling background/floor
+            // This focuses on the cat's body rather than edges where floor/background appear
+            val marginX = (width * 0.2).toInt() // 20% margin on each side = 60% center
+            val marginY = (height * 0.2).toInt()
 
-            for (y in top until bottom step step) {
-                for (x in left until right step step) {
+            val innerLeft = left + marginX
+            val innerTop = top + marginY
+            val innerRight = right - marginX
+            val innerBottom = bottom - marginY
+
+            val innerWidth = innerRight - innerLeft
+            val innerHeight = innerBottom - innerTop
+
+            if (innerWidth <= 0 || innerHeight <= 0) {
+                Log.w(TAG, "Inner region too small, using full bounding box")
+                // Fallback to full box if too small
+                return analyzeCatColorFullBox(bitmap, left, top, right, bottom)
+            }
+
+            Log.d(TAG, "Sampling from inner region: (${innerLeft}, ${innerTop}) to (${innerRight}, ${innerBottom})")
+
+            // Sample pixels from the INNER region only
+            val samples = mutableListOf<Int>()
+            val step = max(1, min(innerWidth, innerHeight) / 20) // Sample ~400 pixels
+
+            for (y in innerTop until innerBottom step step) {
+                for (x in innerLeft until innerRight step step) {
                     if (x < bitmap.width && y < bitmap.height) {
                         samples.add(bitmap.getPixel(x, y))
                     }
@@ -93,22 +114,25 @@ object CatColorAnalyzer {
             val darkRatio = darkPixels.toFloat() / totalSamples
             val brownOrangeRatio = brownOrangePixels.toFloat() / totalSamples
 
-            Log.d(TAG, "Color analysis - Dark: ${(darkRatio * 100).toInt()}%, " +
-                    "BrownOrange: ${(brownOrangeRatio * 100).toInt()}%")
+            Log.d(TAG, "Color analysis - Samples: $totalSamples, Dark: ${(darkRatio * 100).toInt()}%, " +
+                    "BrownOrange: ${(brownOrangeRatio * 100).toInt()}%, Bright: ${(brightPixels.toFloat() / totalSamples * 100).toInt()}%")
 
-            // Classification logic
-            return when {
-                // Black cat: More than 60% dark pixels and less than 15% brown/orange
+            // Classification logic - adjusted for center-focused sampling
+            val result = when {
+                // Black cat: More than 60% dark pixels and very little brown/orange
                 darkRatio > 0.6 && brownOrangeRatio < 0.15 -> CatColor.BLACK
 
-                // Tabby cat: More than 20% brown/orange pixels
+                // Tabby cat: Significant brown/orange pixels
                 brownOrangeRatio > 0.20 -> CatColor.TABBY
 
                 // If we have some brown/orange but not enough dark pixels, likely tabby
                 brownOrangeRatio > 0.12 && darkRatio < 0.5 -> CatColor.TABBY
 
-                // If mostly dark but some color variation, could be dark tabby
-                darkRatio > 0.5 && brownOrangeRatio > 0.08 -> CatColor.TABBY
+                // If mostly dark with very minimal color, it's black
+                darkRatio > 0.5 && brownOrangeRatio < 0.10 -> CatColor.BLACK
+
+                // If dark with some color variation, could be dark tabby (but less threshold now)
+                darkRatio > 0.5 && brownOrangeRatio > 0.15 -> CatColor.TABBY
 
                 // If very dark with minimal color, it's black
                 darkRatio > 0.5 -> CatColor.BLACK
@@ -116,9 +140,67 @@ object CatColorAnalyzer {
                 else -> CatColor.UNKNOWN
             }
 
+            Log.d(TAG, "Color classification result: $result")
+            return result
+
         } catch (e: Exception) {
             Log.e(TAG, "Error analyzing cat color", e)
             return CatColor.UNKNOWN
+        }
+    }
+
+    /**
+     * Fallback method: analyzes color from full bounding box when inner region is too small
+     */
+    private fun analyzeCatColorFullBox(bitmap: Bitmap, left: Int, top: Int, right: Int, bottom: Int): CatColor {
+        val samples = mutableListOf<Int>()
+        val width = right - left
+        val height = bottom - top
+        val step = max(1, min(width, height) / 20)
+
+        for (y in top until bottom step step) {
+            for (x in left until right step step) {
+                if (x < bitmap.width && y < bitmap.height) {
+                    samples.add(bitmap.getPixel(x, y))
+                }
+            }
+        }
+
+        if (samples.isEmpty()) {
+            return CatColor.UNKNOWN
+        }
+
+        var darkPixels = 0
+        var brownOrangePixels = 0
+        val hsv = FloatArray(3)
+
+        for (pixel in samples) {
+            val r = Color.red(pixel)
+            val g = Color.green(pixel)
+            val b = Color.blue(pixel)
+            val brightness = (r + g + b) / 3
+
+            if (brightness < 60) {
+                darkPixels++
+            }
+
+            Color.RGBToHSV(r, g, b, hsv)
+            if (hsv[0] in 10f..70f && hsv[1] > 0.15f && hsv[2] > 0.2f) {
+                brownOrangePixels++
+            }
+        }
+
+        val darkRatio = darkPixels.toFloat() / samples.size
+        val brownOrangeRatio = brownOrangePixels.toFloat() / samples.size
+
+        Log.d(TAG, "Full box analysis - Dark: ${(darkRatio * 100).toInt()}%, BrownOrange: ${(brownOrangeRatio * 100).toInt()}%")
+
+        return when {
+            darkRatio > 0.6 && brownOrangeRatio < 0.15 -> CatColor.BLACK
+            brownOrangeRatio > 0.20 -> CatColor.TABBY
+            darkRatio > 0.5 && brownOrangeRatio < 0.10 -> CatColor.BLACK
+            darkRatio > 0.5 -> CatColor.BLACK
+            else -> CatColor.UNKNOWN
         }
     }
 
