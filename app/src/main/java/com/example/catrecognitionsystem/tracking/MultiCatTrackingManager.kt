@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.RectF
 import android.util.Log
 import com.example.catrecognitionsystem.ml.DetectionResult
+import com.example.catrecognitionsystem.utils.CatColorAnalyzer
 import org.opencv.android.Utils
 import org.opencv.core.Mat
 import org.opencv.imgproc.Imgproc
@@ -11,16 +12,27 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
+ * Result of validation check during tracking
+ */
+data class ValidationResult(
+    val updatedCat: TrackedCat,
+    val validationPassed: Boolean,
+    val shouldStopTracking: Boolean
+)
+
+/**
  * Manages tracking of the most confident cat detection of a specific color
  *
  * @param targetCatColor The specific cat color to track (null = track any color)
  * @param reDetectionFrameInterval Number of frames between full detection runs
  * @param trackingLostTimeoutMs Milliseconds to keep trying to recover lost tracking
+ * @param validationIntervalMs Milliseconds between validation checks (default 2.5 seconds)
  */
 class MultiCatTrackingManager(
-    private var targetCatColor: com.example.catrecognitionsystem.utils.CatColorAnalyzer.CatColor? = null,
+    private var targetCatColor: CatColorAnalyzer.CatColor? = null,
     private val reDetectionFrameInterval: Int = 30,
-    private val trackingLostTimeoutMs: Long = 2000
+    private val trackingLostTimeoutMs: Long = 2000,
+    private val validationIntervalMs: Long = 2500
 ) {
     private val activeTrackers = mutableMapOf<String, CatTracker>()
     private var frameCount = 0
@@ -28,14 +40,24 @@ class MultiCatTrackingManager(
     companion object {
         private const val TAG = "MultiCatTrackingManager"
         private const val IOU_THRESHOLD = 0.3f
+        private const val VALIDATION_IOU_THRESHOLD = 0.2f  // Slightly lower for validation
+        private const val VALIDATION_FAILURE_THRESHOLD = 3  // Stop after 3 consecutive failures
     }
 
     /**
      * Sets the target cat color to track
      */
-    fun setTargetColor(color: com.example.catrecognitionsystem.utils.CatColorAnalyzer.CatColor?) {
+    fun setTargetColor(color: CatColorAnalyzer.CatColor?) {
         targetCatColor = color
         Log.d(TAG, "Target color set to: ${color?.name ?: "ANY"}")
+    }
+
+    /**
+     * Checks if enough time has passed since last validation to run another
+     */
+    fun shouldRunValidation(currentCat: TrackedCat): Boolean {
+        val timeSinceLastValidation = System.currentTimeMillis() - currentCat.lastValidationTimestamp
+        return timeSinceLastValidation >= validationIntervalMs
     }
 
     /**
@@ -129,77 +151,121 @@ class MultiCatTrackingManager(
     }
 
     /**
-     * Merges detection results with current tracked cat
-     * - Matches new detections to existing tracker
-     * - Updates with most confident detection if tracking lost
+     * Merges detection results with current tracked cat and validates tracking
+     * - Matches new detections to existing tracker by IoU AND locked color
+     * - Increments validation failure counter if no match found
+     * - Returns validation result indicating if tracking should stop
      */
     fun mergeDetectionsWithTracking(
         bitmap: Bitmap,
         detections: List<DetectionResult>,
         currentTrackedCats: List<TrackedCat>
-    ): List<TrackedCat> {
+    ): ValidationResult {
         Log.d(TAG, "Merging ${detections.size} detections with ${currentTrackedCats.size} tracked cats")
 
-        // Filter detections by target color
-        val filteredDetections = filterDetectionsByColor(detections)
-
-        if (currentTrackedCats.isEmpty() || filteredDetections.isEmpty()) {
-            return currentTrackedCats
+        if (currentTrackedCats.isEmpty()) {
+            Log.w(TAG, "No tracked cats to validate")
+            return ValidationResult(
+                updatedCat = TrackedCat(
+                    boundingBox = RectF(0f, 0f, 0f, 0f),
+                    confidence = 0f,
+                    catColor = CatColorAnalyzer.CatColor.UNKNOWN,
+                    displayColor = CatDisplayColors.getColorForIndex(0)
+                ),
+                validationPassed = false,
+                shouldStopTracking = true
+            )
         }
 
-        // We only track one cat - the first in the list
         val cat = currentTrackedCats.first()
+        val now = System.currentTimeMillis()
 
-        // Convert bitmap to Mat for tracker updates
+        // Filter detections by LOCKED color (not target color) for validation
+        val colorMatchingDetections = if (cat.lockedColor != CatColorAnalyzer.CatColor.UNKNOWN) {
+            detections.filter { it.color == cat.lockedColor }
+        } else {
+            // If locked color is UNKNOWN, use target color filter
+            filterDetectionsByColor(detections)
+        }
+
+        Log.d(TAG, "Filtered to ${colorMatchingDetections.size} detections matching locked color ${cat.lockedColor}")
+
+        // Convert bitmap to Mat for potential tracker reinitialization
         val mat = Mat()
         val bitmapCopy = bitmap.copy(Bitmap.Config.ARGB_8888, false)
         Utils.bitmapToMat(bitmapCopy, mat)
         val frameMat = Mat()
         Imgproc.cvtColor(mat, frameMat, Imgproc.COLOR_RGBA2RGB)
 
-        // Find best matching detection or highest confidence detection
-        var bestDetection: DetectionResult? = null
+        // Find detection that matches BOTH location (IoU) AND color
+        var bestMatchingDetection: DetectionResult? = null
         var bestIoU = 0f
 
-        for (detection in filteredDetections) {
+        for (detection in colorMatchingDetections) {
             val iou = calculateIoU(cat.boundingBox, detection.boundingBox)
-            if (iou > IOU_THRESHOLD && iou > bestIoU) {
-                bestDetection = detection
+            if (iou > VALIDATION_IOU_THRESHOLD && iou > bestIoU) {
+                bestMatchingDetection = detection
                 bestIoU = iou
             }
         }
 
-        // If no matching detection found but tracker is lost, use most confident detection
-        if (bestDetection == null && cat.isLost) {
-            bestDetection = filteredDetections.maxByOrNull { it.confidence }
-            Log.d(TAG, "Using most confident detection for lost tracker")
-        }
+        val validationPassed = bestMatchingDetection != null
 
-        val updatedCat = if (bestDetection != null) {
-            // If tracker was lost, reinitialize it
+        val updatedCat = if (bestMatchingDetection != null) {
+            // VALIDATION PASSED: Found matching cat at tracking location
+            Log.d(TAG, "Validation PASSED: Found ${cat.lockedColor} cat with IoU=$bestIoU")
+
+            // Reinitialize tracker if it was lost
             if (cat.isLost) {
                 Log.d(TAG, "Reinitializing lost tracker for cat ${cat.id}")
                 removeTracker(cat.id)
-                createTracker(cat.id, bestDetection.boundingBox, frameMat)
+                createTracker(cat.id, bestMatchingDetection.boundingBox, frameMat)
             }
 
             cat.copy(
-                boundingBox = bestDetection.boundingBox,
-                confidence = bestDetection.confidence,
-                catColor = bestDetection.color,
+                boundingBox = bestMatchingDetection.boundingBox,
+                confidence = bestMatchingDetection.confidence,
+                // catColor stays as lockedColor - don't update from detection
                 isLost = false,
                 framesSinceDetection = 0,
-                lastSeenTimestamp = System.currentTimeMillis()
+                lastSeenTimestamp = now,
+                consecutiveValidationFailures = 0,
+                lastValidationTimestamp = now,
+                validationStatus = ValidationStatus.VALID
             )
         } else {
-            // No matching detection - keep existing tracking result
-            cat
+            // VALIDATION FAILED: No matching cat found at tracking location
+            val newFailureCount = cat.consecutiveValidationFailures + 1
+            Log.d(TAG, "Validation FAILED: No ${cat.lockedColor} cat found at tracking location. Failures: $newFailureCount/$VALIDATION_FAILURE_THRESHOLD")
+
+            val newStatus = when {
+                newFailureCount >= VALIDATION_FAILURE_THRESHOLD -> ValidationStatus.INVALID
+                newFailureCount >= 1 -> ValidationStatus.UNCERTAIN
+                else -> ValidationStatus.VALID
+            }
+
+            cat.copy(
+                consecutiveValidationFailures = newFailureCount,
+                lastValidationTimestamp = now,
+                validationStatus = newStatus,
+                isLost = newFailureCount >= 2
+            )
         }
 
         mat.release()
         frameMat.release()
 
-        return listOf(updatedCat)
+        val shouldStop = updatedCat.validationStatus == ValidationStatus.INVALID
+
+        if (shouldStop) {
+            Log.w(TAG, "Tracking should STOP: ${updatedCat.consecutiveValidationFailures} consecutive validation failures")
+        }
+
+        return ValidationResult(
+            updatedCat = updatedCat,
+            validationPassed = validationPassed,
+            shouldStopTracking = shouldStop
+        )
     }
 
     /**
@@ -230,13 +296,18 @@ class MultiCatTrackingManager(
 
         // Take only the most confident detection of the target color
         val bestDetection = filteredDetections.maxByOrNull { it.confidence }!!
+        val now = System.currentTimeMillis()
 
         val trackedCat = TrackedCat(
             boundingBox = bestDetection.boundingBox,
             confidence = bestDetection.confidence,
             catColor = bestDetection.color,
+            lockedColor = bestDetection.color,  // Lock color at initialization
             displayColor = CatDisplayColors.getColorForIndex(0),
-            label = bestDetection.label
+            label = bestDetection.label,
+            consecutiveValidationFailures = 0,
+            lastValidationTimestamp = now,
+            validationStatus = ValidationStatus.VALID
         )
 
         // Create OpenCV tracker

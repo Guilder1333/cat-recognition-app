@@ -31,6 +31,7 @@ import com.example.catrecognitionsystem.ml.DetectionResult
 import com.example.catrecognitionsystem.tracking.MultiCatTrackingManager
 import com.example.catrecognitionsystem.tracking.TrackedCat
 import com.example.catrecognitionsystem.tracking.TrackingMode
+import com.example.catrecognitionsystem.tracking.ValidationStatus
 import com.example.catrecognitionsystem.utils.CatColorAnalyzer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -79,7 +80,21 @@ fun CatDetectionScreen(
                                     trackingManager = trackingManager,
                                     catDetector = catDetector,
                                     currentState = detectionState,
-                                    onStateUpdate = { detectionState = it }
+                                    onStateUpdate = { detectionState = it },
+                                    onTrackingLost = {
+                                        // Handle definitive tracking loss - auto-stop tracking
+                                        scope.launch {
+                                            stopTracking(
+                                                trackingManager = trackingManager,
+                                                onStateUpdate = { detectionState = it },
+                                                onTrackingStopped = {
+                                                    isTrackingActive = false
+                                                    isWaitingForFirstFrame = false
+                                                    firstFrameForTracking = null
+                                                }
+                                            )
+                                        }
+                                    }
                                 )
                             }
                         }
@@ -453,9 +468,18 @@ fun DetectionResultsCard(state: CatDetectionState, trackingColor: CatColorAnalyz
 
             if (isTracking && state.trackedCats.isNotEmpty()) {
                 val cat = state.trackedCats.first()
-                val colorName = CatColorAnalyzer.getColorName(cat.catColor)
-                val statusText = if (cat.isLost) "Lost tracking" else "Tracking active"
-                val statusColor = if (cat.isLost) Color.Red else Color.Green
+                val colorName = CatColorAnalyzer.getColorName(cat.lockedColor)
+
+                val statusText = when (cat.validationStatus) {
+                    ValidationStatus.VALID -> "Tracking active"
+                    ValidationStatus.UNCERTAIN -> "Tracking uncertain (${cat.consecutiveValidationFailures} checks failed)"
+                    ValidationStatus.INVALID -> "Tracking lost"
+                }
+                val statusColor = when (cat.validationStatus) {
+                    ValidationStatus.VALID -> Color.Green
+                    ValidationStatus.UNCERTAIN -> Color.Yellow
+                    ValidationStatus.INVALID -> Color.Red
+                }
 
                 Text(
                     text = statusText,
@@ -466,9 +490,19 @@ fun DetectionResultsCard(state: CatDetectionState, trackingColor: CatColorAnalyz
                 Spacer(modifier = Modifier.height(8.dp))
 
                 Text(
-                    text = "$colorName Cat: ${(cat.confidence * 100).toInt()}% confidence",
+                    text = "$colorName Cat (locked): ${(cat.confidence * 100).toInt()}% confidence",
                     style = MaterialTheme.typography.bodyMedium
                 )
+
+                // Show validation info when not valid
+                if (cat.validationStatus != ValidationStatus.VALID) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Validation failures: ${cat.consecutiveValidationFailures}/3",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             } else if (state.capturedImage == null && !isTracking) {
                 Text(
                     text = "No image captured yet. Press 'Start Tracking' to begin.",
@@ -521,9 +555,17 @@ fun TrackingOverlay(
             val right = cat.boundingBox.right * size.width
             val bottom = cat.boundingBox.bottom * size.height
 
-            // Choose color based on tracking state
-            val color = if (cat.isLost) Color.Red else cat.displayColor
-            val strokeWidth = if (cat.isLost) 6f else 4f
+            // Choose color based on validation status
+            val color = when (cat.validationStatus) {
+                ValidationStatus.VALID -> cat.displayColor
+                ValidationStatus.UNCERTAIN -> Color.Yellow
+                ValidationStatus.INVALID -> Color.Red
+            }
+            val strokeWidth = when (cat.validationStatus) {
+                ValidationStatus.VALID -> 4f
+                ValidationStatus.UNCERTAIN -> 5f
+                ValidationStatus.INVALID -> 6f
+            }
 
             // Draw bounding box
             drawRect(
@@ -533,13 +575,24 @@ fun TrackingOverlay(
                 style = Stroke(width = strokeWidth)
             )
 
-            // Draw label
-            val colorName = CatColorAnalyzer.getColorName(cat.catColor)
+            // Draw label using locked color (not current detection color)
+            val colorName = CatColorAnalyzer.getColorName(cat.lockedColor)
             val confidenceText = "${(cat.confidence * 100).toInt()}%"
-            val label = if (cat.isLost) "LOST - $colorName" else "$colorName $confidenceText"
+            val statusIndicator = when (cat.validationStatus) {
+                ValidationStatus.VALID -> ""
+                ValidationStatus.UNCERTAIN -> " [?]"
+                ValidationStatus.INVALID -> " [LOST]"
+            }
+            val label = "$colorName $confidenceText$statusIndicator"
+
+            val textColor = when (cat.validationStatus) {
+                ValidationStatus.VALID -> android.graphics.Color.WHITE
+                ValidationStatus.UNCERTAIN -> android.graphics.Color.YELLOW
+                ValidationStatus.INVALID -> android.graphics.Color.RED
+            }
 
             val paint = android.graphics.Paint().apply {
-                setColor(android.graphics.Color.WHITE)
+                setColor(textColor)
                 textSize = 40f
                 isAntiAlias = true
                 setShadowLayer(4f, 0f, 0f, android.graphics.Color.BLACK)
@@ -656,37 +709,55 @@ private suspend fun processTrackingFrame(
     trackingManager: MultiCatTrackingManager,
     catDetector: CatDetector,
     currentState: CatDetectionState,
-    onStateUpdate: (CatDetectionState) -> Unit
+    onStateUpdate: (CatDetectionState) -> Unit,
+    onTrackingLost: () -> Unit
 ) {
     try {
         val currentCats = currentState.trackedCats
+        val currentCat = currentCats.firstOrNull() ?: return
 
         android.util.Log.d("CatDetectionScreen", "Processing tracking frame: ${bitmap.width}x${bitmap.height}, tracked cats: ${currentCats.size}")
 
-        // Check if we should run detection
-        if (trackingManager.shouldRunDetection()) {
-            android.util.Log.d("CatDetectionScreen", "Running periodic detection")
+        // Check if we should run validation (time-based or frame-based)
+        val shouldValidate = trackingManager.shouldRunDetection() ||
+                             trackingManager.shouldRunValidation(currentCat)
+
+        if (shouldValidate) {
+            android.util.Log.d("CatDetectionScreen", "Running periodic detection/validation")
 
             // Run detection
             val detections = catDetector.detectCats(bitmap)
             android.util.Log.d("CatDetectionScreen", "Periodic detection found ${detections.size} cats")
 
-            // Merge with tracking
-            val updatedCats = trackingManager.mergeDetectionsWithTracking(
+            // Merge with tracking and validate
+            val validationResult = trackingManager.mergeDetectionsWithTracking(
                 bitmap, detections, currentCats
             )
 
-            android.util.Log.d("CatDetectionScreen", "After merge: ${updatedCats.size} tracked cats")
+            android.util.Log.d("CatDetectionScreen", "Validation result: passed=${validationResult.validationPassed}, shouldStop=${validationResult.shouldStopTracking}")
 
-            // Update state
+            // Check for definitive tracking loss
+            if (validationResult.shouldStopTracking) {
+                android.util.Log.w("CatDetectionScreen", "TRACKING DEFINITIVELY LOST - auto-stopping tracking")
+                withContext(Dispatchers.Main) {
+                    onStateUpdate(currentState.copy(
+                        trackedCats = listOf(validationResult.updatedCat),
+                        errorMessage = "Tracking stopped: Cat no longer detected at tracking location"
+                    ))
+                    onTrackingLost()
+                }
+                return
+            }
+
+            // Update state with validation result
             withContext(Dispatchers.Main) {
                 onStateUpdate(currentState.copy(
-                    trackedCats = updatedCats,
-                    hasCats = updatedCats.isNotEmpty()
+                    trackedCats = listOf(validationResult.updatedCat),
+                    hasCats = true
                 ))
             }
         } else {
-            // Just update tracking
+            // Just update tracking (no validation)
             val updatedCats = trackingManager.processFrame(bitmap, currentCats)
 
             if (updatedCats.size != currentCats.size || updatedCats.firstOrNull()?.isLost != currentCats.firstOrNull()?.isLost) {

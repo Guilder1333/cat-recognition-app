@@ -10,7 +10,11 @@
       "Bash(del:*)",
       "Bash(./gradlew assembleDebug:*)",
       "Bash(./gradlew installDebug:*)",
-      "Bash(./gradlew:*)"
+      "Bash(./gradlew:*)",
+      "Bash(.\\\\gradlew assembleDebug:*)",
+      "Bash(gradlew.bat assembleDebug:*)",
+      "Bash(cmd /c \"gradlew.bat assembleDebug\")",
+      "Bash(./gradlew.bat assembleDebug:*)"
     ]
   }
 }
