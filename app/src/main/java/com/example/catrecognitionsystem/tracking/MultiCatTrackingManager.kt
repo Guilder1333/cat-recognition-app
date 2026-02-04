@@ -225,7 +225,7 @@ class MultiCatTrackingManager(
             cat.copy(
                 boundingBox = bestMatchingDetection.boundingBox,
                 confidence = bestMatchingDetection.confidence,
-                // catColor stays as lockedColor - don't update from detection
+                catColor = bestMatchingDetection.color,  // Re-analyze color from fresh detection
                 isLost = false,
                 framesSinceDetection = 0,
                 lastSeenTimestamp = now,

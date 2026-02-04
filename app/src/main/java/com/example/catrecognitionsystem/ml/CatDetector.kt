@@ -18,13 +18,18 @@ class CatDetector(context: Context) {
     private val labels: List<String>
     private val catClassIndex: Int
 
+    // Debug info accessible from outside
+    var lastDebugInfo: String = "Not initialized"
+        private set
+    private var modelInfo: String = ""
+
     companion object {
         private const val TAG = "CatDetector"
-        private const val MODEL_FILE = "detect.tflite"
+        private const val MODEL_FILE = "detect.tflite"  // SSD MobileNet (COCO)
         private const val LABELS_FILE = "labelmap.txt"
-        private const val INPUT_SIZE = 300
-        private const val CONFIDENCE_THRESHOLD = 0.1f  // Very low threshold for debugging
-        private const val MAX_DETECTIONS = 10
+        private const val INPUT_SIZE = 300  // SSD MobileNet uses 300x300 input
+        private const val CONFIDENCE_THRESHOLD = 0.1f  // Low threshold — SSD MobileNet COCO scores cats conservatively
+        private const val MAX_DETECTIONS = 10  // SSD MobileNet detects up to 10
         private const val DEFAULT_CAT_INDEX = 17 // Default cat index in COCO
 
         // Output indices for SSD MobileNet
@@ -51,6 +56,30 @@ class CatDetector(context: Context) {
 
             interpreter = Interpreter(modelBuffer, options)
 
+            // Log model input/output details for debugging
+            val inputCount = interpreter!!.inputTensorCount
+            val outputCount = interpreter!!.outputTensorCount
+            Log.d(TAG, "Model has $inputCount inputs and $outputCount outputs")
+
+            val infoBuilder = StringBuilder()
+            infoBuilder.append("Model: $MODEL_FILE\n")
+            infoBuilder.append("Inputs: $inputCount, Outputs: $outputCount\n")
+
+            for (i in 0 until inputCount) {
+                val tensor = interpreter!!.getInputTensor(i)
+                val info = "In$i: ${tensor.shape().contentToString()} ${tensor.dataType()}"
+                Log.d(TAG, info)
+                infoBuilder.append("$info\n")
+            }
+
+            for (i in 0 until outputCount) {
+                val tensor = interpreter!!.getOutputTensor(i)
+                val info = "Out$i: ${tensor.shape().contentToString()} ${tensor.dataType()}"
+                Log.d(TAG, info)
+                infoBuilder.append("$info\n")
+            }
+            modelInfo = infoBuilder.toString()
+
             // Load labels
             tempLabels = FileUtil.loadLabels(context, LABELS_FILE)
 
@@ -64,8 +93,11 @@ class CatDetector(context: Context) {
             }
 
             Log.d(TAG, "CatDetector initialized successfully")
+            lastDebugInfo = modelInfo + "Init: OK\nCat idx: $tempCatIndex"
         } catch (e: Exception) {
             Log.e(TAG, "Error initializing CatDetector", e)
+            lastDebugInfo = "INIT ERROR: ${e.message}"
+            modelInfo = "FAILED"
         }
 
         // Assign final values
@@ -81,6 +113,7 @@ class CatDetector(context: Context) {
     fun detectCats(bitmap: Bitmap): List<DetectionResult> {
         if (interpreter == null) {
             Log.e(TAG, "Interpreter is null, cannot perform detection")
+            lastDebugInfo = "ERROR: Interpreter is null\n$modelInfo"
             return emptyList()
         }
 
@@ -105,6 +138,7 @@ class CatDetector(context: Context) {
             return uniqueDetections
         } catch (e: Exception) {
             Log.e(TAG, "Error during detection", e)
+            lastDebugInfo = "DETECT ERROR: ${e.message}\n${e.stackTraceToString().take(300)}"
             return emptyList()
         }
     }
@@ -142,6 +176,20 @@ class CatDetector(context: Context) {
             Log.d(TAG, "First 3 scores: ${outputScores[0].take(3).joinToString()}")
             Log.d(TAG, "First 3 classes: ${outputClasses[0].take(3).joinToString()}")
 
+            // Build debug info for UI display
+            val debugBuilder = StringBuilder()
+            debugBuilder.append(modelInfo)
+            debugBuilder.append("---\n")
+            debugBuilder.append("Count: ${outputCount[0].toInt()}\n")
+            debugBuilder.append("Top scores: ${outputScores[0].take(5).map { "%.2f".format(it) }}\n")
+            debugBuilder.append("Top classes: ${outputClasses[0].take(5).map { it.toInt() }}\n")
+            debugBuilder.append("Cat index: $catClassIndex\n")
+            // Show first detection box
+            if (outputCount[0] > 0) {
+                debugBuilder.append("Box0: ${outputLocations[0][0].map { "%.2f".format(it) }}\n")
+            }
+            lastDebugInfo = debugBuilder.toString()
+
             // Parse results and filter for cats, using original bitmap for color analysis
             return parseDetections(
                 originalBitmap,
@@ -153,6 +201,7 @@ class CatDetector(context: Context) {
             )
         } catch (e: Exception) {
             Log.e(TAG, "Error in single detection", e)
+            lastDebugInfo = "INFERENCE ERROR: ${e.message}\n${e.stackTraceToString().take(300)}"
             return emptyList()
         }
     }
@@ -247,13 +296,9 @@ class CatDetector(context: Context) {
                 continue
             }
 
-            // Filter for cat class only
-            // Handle both 0-indexed and potential off-by-one issues
-            val isCat = classIndex == catClassIndex ||
-                        classIndex == catClassIndex + 1 ||
-                        classIndex == catClassIndex - 1
-
-            if (!isCat) {
+            // Filter for cat class — allow ±1 tolerance due to background class offset
+            // Model outputs 0-based indices; labelmap includes background at index 0
+            if (classIndex != catClassIndex && classIndex != catClassIndex - 1 && classIndex != catClassIndex + 1) {
                 continue
             }
 

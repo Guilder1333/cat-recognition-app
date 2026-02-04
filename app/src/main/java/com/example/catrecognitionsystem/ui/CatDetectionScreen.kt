@@ -125,7 +125,8 @@ fun CatDetectionScreen(
             if (detections.isEmpty()) {
                 detectionState = CatDetectionState(
                     isProcessing = false,
-                    errorMessage = "No cats detected. Please ensure a cat is visible."
+                    errorMessage = "No cats detected. Please ensure a cat is visible.",
+                    debugInfo = catDetector.lastDebugInfo
                 )
                 isWaitingForFirstFrame = false
                 firstFrameForTracking = null
@@ -140,7 +141,8 @@ fun CatDetectionScreen(
             if (trackedCats.isEmpty()) {
                 detectionState = CatDetectionState(
                     isProcessing = false,
-                    errorMessage = "No cats of the selected color detected. Try changing the color filter."
+                    errorMessage = "No cats of the selected color detected. Try changing the color filter.",
+                    debugInfo = catDetector.lastDebugInfo
                 )
                 isWaitingForFirstFrame = false
                 firstFrameForTracking = null
@@ -155,7 +157,8 @@ fun CatDetectionScreen(
                 isProcessing = false,
                 errorMessage = null,
                 trackingMode = TrackingMode.ActiveTracking(trackedCats, 0),
-                trackedCats = trackedCats
+                trackedCats = trackedCats,
+                debugInfo = catDetector.lastDebugInfo
             )
 
             isWaitingForFirstFrame = false
@@ -353,6 +356,24 @@ fun CatDetectionScreen(
                     text = detectionState.errorMessage!!,
                     modifier = Modifier.padding(16.dp),
                     color = MaterialTheme.colorScheme.onErrorContainer
+                )
+            }
+        }
+
+        // Debug info card
+        if (detectionState.debugInfo != null) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant
+                )
+            ) {
+                Text(
+                    text = detectionState.debugInfo!!,
+                    modifier = Modifier.padding(8.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                    fontSize = 10.sp
                 )
             }
         }

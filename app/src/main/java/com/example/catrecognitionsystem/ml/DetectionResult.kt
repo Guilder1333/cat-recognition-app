@@ -21,5 +21,6 @@ data class CatDetectionState(
     val isProcessing: Boolean = false,
     val errorMessage: String? = null,
     val trackingMode: TrackingMode = TrackingMode.Idle,
-    val trackedCats: List<TrackedCat> = emptyList()
+    val trackedCats: List<TrackedCat> = emptyList(),
+    val debugInfo: String? = null  // Debug info for model output inspection
 )

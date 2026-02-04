@@ -4,24 +4,26 @@ This document helps AI assistants understand the Cat Recognition App project str
 
 ## Project Overview
 
-Android application that detects and tracks cats in real-time using TensorFlow Lite for detection and OpenCV for tracking. Built with Kotlin, Jetpack Compose, and CameraX.
+Android application that detects and tracks cats using TensorFlow Lite for detection and OpenCV for tracking. Goal: automatically open a door when a cat is detected nearby (no collars). Built with Kotlin, Jetpack Compose, and CameraX.
 
 **Key Features:**
-- Real-time cat detection using TFLite SSD MobileNet
+- Cat detection using TFLite SSD MobileNet v1 (two-pass: original + flipped for better recall)
 - Continuous video tracking with OpenCV TrackerMIL
-- Color-based filtering (Black, Tabby, or Any)
-- Hybrid detection/tracking for performance
-- Live camera overlay with bounding boxes
+- Color-based filtering and classification (Black, Tabby, or Any)
+- Periodic validation against fresh detections with auto-stop on loss
+- Live camera overlay with bounding boxes and status indicators
+- Debug info card on screen showing raw model output (useful during tuning)
 
 ## Architecture
 
 ### High-Level Flow
 1. User presses "Start Tracking"
 2. ImageAnalysis captures first frame from camera
-3. TFLite model detects cats in frame
-4. OpenCV TrackerMIL initializes on most confident cat
-5. Continuous tracking at ~30 FPS
-6. Periodic re-detection every 30 frames to correct drift
+3. TFLite model runs two-pass detection (original + flipped) on frame
+4. OpenCV TrackerMIL initializes on most confident cat matching selected color
+5. Continuous tracking at ~30 FPS via OpenCV
+6. Periodic validation every ~2.5s: re-runs detection, checks IoU + color match against tracked position
+7. Auto-stops if 3 consecutive validations fail (cat no longer at tracked location)
 
 ### Key Components
 
@@ -30,18 +32,20 @@ app/src/main/java/com/example/catrecognitionsystem/
 ├── camera/
 │   └── CameraManager.kt          # CameraX integration, frame processing
 ├── ml/
-│   ├── CatDetector.kt             # TFLite inference wrapper
-│   └── DetectionResult.kt         # Detection data classes
+│   ├── CatDetector.kt             # TFLite inference wrapper (two-pass: original + flipped)
+│   └── DetectionResult.kt         # Detection data classes + CatDetectionState
 ├── tracking/
-│   ├── MultiCatTrackingManager.kt # Orchestrates tracking lifecycle
+│   ├── MultiCatTrackingManager.kt # Orchestrates tracking lifecycle and validation
 │   ├── CatTracker.kt              # OpenCV TrackerMIL wrapper
-│   ├── TrackedCat.kt              # Tracking state data class
-│   └── TrackingMode.kt            # State machine states
+│   ├── TrackedCat.kt              # Tracking state data class + ValidationStatus + CatDisplayColors
+│   └── TrackingState.kt           # TrackingMode sealed class (Idle, InitialDetection, ActiveTracking, TrackingLost)
 ├── ui/
-│   └── CatDetectionScreen.kt     # Main Compose UI with tracking overlay
+│   ├── CatDetectionScreen.kt     # Main Compose UI with tracking overlay
+│   └── theme/                     # Material3 theme (Color.kt, Theme.kt, Type.kt)
 ├── utils/
-│   └── CatColorAnalyzer.kt       # HSV-based color classification
-└── MainActivity.kt                # OpenCV initialization, entry point
+│   ├── CatColorAnalyzer.kt       # HSV-based color classification (BLACK, TABBY, UNKNOWN)
+│   └── BitmapUtils.kt            # Bitmap scaling, preprocessing (float + quantized), flipping
+└── MainActivity.kt                # OpenCV initialization, permission handling, entry point
 ```
 
 ## Critical Implementation Details
@@ -63,7 +67,7 @@ if (format == android.graphics.ImageFormat.JPEG) {
 
 **Common Bug:** Trying to decode RGBA data as JPEG will fail silently and return null, causing tracking to hang.
 
-### 2. Two-Phase Tracking Initialization (CatDetectionScreen.kt:59-147)
+### 2. Two-Phase Tracking Initialization (CatDetectionScreen.kt:60-170)
 
 **Problem:** ImageCapture and ImageAnalysis provide frames from different times, causing tracker to initialize on wrong frame.
 
@@ -116,19 +120,43 @@ val bestDetection = filteredDetections.maxByOrNull { it.confidence }!!
 
 Color filter set via `trackingManager.setTargetColor(selectedCatColor)` before tracking starts.
 
-### 5. Detection Model (detect.tflite)
+**Two color fields on TrackedCat — do not confuse:**
+- `lockedColor` — set once at initialization, never changes. Used by `mergeDetectionsWithTracking()` to filter validation detections (only matches cats of the same color).
+- `catColor` — updated from the fresh detection each time validation passes. Used for display only.
+
+### 5. Validation and Auto-Stop
+
+During active tracking, `mergeDetectionsWithTracking()` runs periodically (controlled by `validationIntervalMs`, default 2.5s). It checks whether a detection of the correct color and overlapping IoU exists at the tracked position.
+
+- **Pass:** resets `consecutiveValidationFailures` to 0, status → `VALID`
+- **Fail:** increments `consecutiveValidationFailures`, status → `UNCERTAIN` (1-2 failures) or `INVALID` (3+ failures)
+- **INVALID** triggers `shouldStopTracking = true`, which auto-stops tracking in `CatDetectionScreen`
+
+Thresholds in `MultiCatTrackingManager`:
+- `VALIDATION_IOU_THRESHOLD = 0.2` — minimum IoU to count as a match during validation
+- `IOU_THRESHOLD = 0.3` — general matching
+- `VALIDATION_FAILURE_THRESHOLD = 3` — consecutive failures before auto-stop
+
+### 6. Detection Model (detect.tflite)
 
 **Location:** `app/src/main/assets/detect.tflite`
 
-**Type:** SSD MobileNet trained on COCO dataset
+**Type:** SSD MobileNet v1, quantized (uint8), trained on COCO dataset
 
 **Classes:**
-- Index 16 or 17 = "cat" (flexible matching with ±1 tolerance)
-- Confidence threshold: 0.1 (lowered for better detection)
+- Model outputs class 16 for cat; labelmap has cat at index 17 (off-by-one due to background class at index 0)
+- `parseDetections()` matches with ±1 tolerance around `catClassIndex` to handle this
+- Confidence threshold: 0.1
 
-**Input:** 300x300 RGB image
+**Input:** 300x300 uint8 RGB image (use `BitmapUtils.preprocessBitmapQuantized`)
 
-**Output:** Bounding boxes, class indices, scores
+**Output:** 4 tensors via `runForMultipleInputsOutputs`:
+- Index 0: locations `[1, 10, 4]` — bounding boxes as `[top, left, bottom, right]` normalized [0,1]
+- Index 1: classes `[1, 10]` — class indices (float)
+- Index 2: scores `[1, 10]` — confidence scores (float)
+- Index 3: count `[1]` — number of detections (float)
+
+**Two-pass strategy:** Detection runs twice per frame — once on the original image, once on a horizontally flipped image. Results are merged and deduplicated using IoU > 0.5, keeping the higher-confidence detection. This improves recall for cats at unusual angles but roughly doubles inference time.
 
 ## File Locations
 
@@ -138,11 +166,13 @@ Color filter set via `trackingManager.setTargetColor(selectedCatColor)` before t
 - `opencv/build.gradle` - OpenCV module config (Java 11, BuildConfig, AIDL)
 
 ### Assets
-- `app/src/main/assets/detect.tflite` - Detection model
-- `app/src/main/assets/labelmap.txt` - Class labels (if present)
+- `app/src/main/assets/detect.tflite` - Current detection model (SSD MobileNet v1, quantized)
+- `app/src/main/assets/efficientdet_lite0.tflite` - Next model (MediaPipe format, requires Tasks API — see Roadmap Phase 1)
+- `app/src/main/assets/labelmap.txt` - COCO class labels (91 entries, includes background placeholders as `???`)
 
 ### Setup Scripts
 - `setup-opencv.bat` / `setup-opencv.sh` - Downloads OpenCV SDK
+- `setup-efficientdet.bat` - Downloads EfficientDet-Lite0 model from MediaPipe model zoo
 
 ## Build Instructions
 
@@ -182,6 +212,14 @@ adb logcat -s CatDetectionScreen CameraManager MultiCatTrackingManager CatDetect
 - Lower confidence threshold in CatDetector.kt
 - Improve lighting conditions
 - Ensure cat is clearly visible and not occluded
+
+### Issue: SSD MobileNet detects cats as class 16 instead of 17
+**Cause:** The model outputs 0-based class indices without a background class, but `labelmap.txt` includes a background placeholder (`???`) at index 0, shifting everything by +1. Cat is at labelmap index 17, but model outputs 16.
+**Solution:** Match with ±1 tolerance around `catClassIndex` in `CatDetector.kt:parseDetections()`
+
+### Issue: MediaPipe EfficientDet model fails to load with raw Interpreter
+**Cause:** Models from `storage.googleapis.com/mediapipe-models/` are packaged with MediaPipe metadata. The standard TFLite `Interpreter` cannot parse them — `interpreter` stays null.
+**Solution:** Use MediaPipe Tasks `ObjectDetector` API instead of raw `Interpreter`. See Roadmap Phase 1.
 
 ### Issue: OpenCV TrackerKCF not found
 **Cause:** TrackerKCF not available in OpenCV 4.8.0 Java bindings
@@ -249,11 +287,12 @@ MultiCatTrackingManager: Running periodic detection (every 30 frames)
 
 ## Performance Targets
 
-- **FPS:** 25-30 FPS during active tracking
-- **Detection latency:** <100ms per frame
-- **Tracking latency:** <50ms per frame (OpenCV only)
+- **FPS:** 25-30 FPS during active tracking (OpenCV tracker runs every frame; detection does not)
+- **Detection latency:** ~60-120ms per invocation (two-pass doubles single-pass cost); detection runs periodically, not every frame
+- **Tracking latency:** <50ms per frame (OpenCV TrackerMIL only)
 - **Memory:** Stable over 10+ minutes, no leaks
 - **Battery:** <15% drain per 5 minutes continuous use
+- **Target latency budget:** up to ~1 second per detection is acceptable for the door-opening use case
 
 ## Dependencies
 
@@ -282,16 +321,51 @@ MultiCatTrackingManager: Running periodic detection (every 30 frames)
 5. **No persistence** - Tracking state lost when app is closed
 6. **No recording** - Cannot save tracked video, only live tracking
 
-## Future Improvements (If Requested)
+## Roadmap
 
-1. Multi-cat tracking (revert to original design)
-2. Custom TFLite model trained specifically for cats
-3. Tracking history/trajectory visualization
-4. Video recording with tracking overlay
-5. Persistent cat identification across sessions
-6. Performance optimization (reduce FPS for battery life)
-7. Kalman filter for smoother tracking
-8. Support for front camera
+Goal: reliable cat detection at a door to trigger automatic door opening. No collars. Up to ~1 second detection latency is acceptable.
+
+### Phase 1 — Switch to MediaPipe Tasks + EfficientDet-Lite0 (current)
+
+**Status:** In progress
+
+- Replace raw TFLite Interpreter with MediaPipe Tasks ObjectDetector API
+- `efficientdet_lite0.tflite` is already in assets (downloaded via `setup-efficientdet.bat`) but cannot be loaded by the standard Interpreter — it uses MediaPipe's packaged format with embedded metadata
+- EfficientDet-Lite0 is significantly more accurate than the current SSD MobileNet v1
+- Add `com.google.android.mediapipe:tasks-vision` dependency to `app/build.gradle.kts`
+- Rewrite `CatDetector.kt` to use `ObjectDetector` from MediaPipe Tasks instead of `Interpreter`
+- Tune confidence threshold after switching (start at 0.3, adjust based on results)
+- If EfficientDet-Lite0 is not accurate enough, upgrade to EfficientDet-Lite2 (heavier, ~500-800ms, still within budget)
+
+**Known pitfalls from previous attempts:**
+- Do NOT try to load MediaPipe models with the raw `Interpreter` — it will fail with null interpreter
+- The model file format looks like a valid .tflite but has extra MediaPipe metadata wrapper
+
+### Phase 2 — Tune tracking and color detection
+
+**Status:** Not started. Depends on Phase 1.
+
+- Color detection currently re-analyzes on periodic re-detection (fixed in this session), but accuracy depends on HSV thresholds in `CatColorAnalyzer.kt` — tune ranges against real cats after Phase 1 is stable
+- Tracker drift: evaluate whether `reDetectionFrameInterval` (currently 30 frames) needs adjustment with the new model's latency characteristics
+- Validation IoU thresholds in `MultiCatTrackingManager` (currently 0.2 for validation, 0.3 for general) may need tuning once detection bounding boxes change with the new model
+- Consider whether continuous OpenCV tracking is still needed or if periodic detection alone (every 1s) is sufficient for the door-opening use case
+
+### Phase 3 — Motion detection and movement-based ROI
+
+**Status:** Not started. Depends on Phase 2.
+
+- Add lightweight frame-differencing motion detector that runs every frame (cheap, no ML)
+- Only invoke the heavy detection model when motion is detected, saving battery and CPU
+- Define a configurable door ROI (region of interest) in the camera frame — only trigger door open when cat is detected inside the ROI
+- ROI should be configurable via the UI: let user draw or select the door zone on first setup
+- Detection outside the ROI can be ignored entirely, or used to track cat approaching the door zone
+
+### Deferred
+
+- Multi-cat tracking
+- Video recording with tracking overlay
+- Tracking history/trajectory visualization
+- Front camera support
 
 ## Git Workflow
 
@@ -304,7 +378,7 @@ MultiCatTrackingManager: Running periodic detection (every 30 frames)
 ### Important Files to Commit
 - All `.kt` source files
 - `build.gradle.kts`, `settings.gradle.kts`
-- `setup-opencv.bat`, `setup-opencv.sh`
+- `setup-opencv.bat`, `setup-opencv.sh`, `setup-efficientdet.bat`
 - `README.md`, `CLAUDE.md`
 - `.gitignore`
 
@@ -316,7 +390,7 @@ MultiCatTrackingManager: Running periodic detection (every 30 frames)
 ## Quick Reference: Common Tasks
 
 ### Add new detection class
-1. Modify `CatDetector.kt:detectCats()` class index check
+1. Modify `CatDetector.kt:parseDetections()` — the class index filter with ±1 tolerance is there
 2. Update confidence threshold if needed
 3. Test with diverse images
 
@@ -332,7 +406,9 @@ MultiCatTrackingManager: Running periodic detection (every 30 frames)
 
 ### Add new cat color
 1. Add enum value to `CatColorAnalyzer.CatColor`
-2. Implement HSV range in `analyzeColor()`
+2. Implement classification logic in `analyzeCatColor()` — current approach samples the inner 60% of the bounding box and classifies based on pixel ratios:
+   - BLACK: >60% dark pixels (brightness < 60) and <15% brown/orange
+   - TABBY: >20% brown/orange pixels (HSV hue 10-70°, saturation >0.15, value >0.2)
 3. Add FilterChip in `CatDetectionScreen.kt`
 4. Update `getColorName()` helper
 
@@ -350,7 +426,8 @@ MultiCatTrackingManager: Running periodic detection (every 30 frames)
 
 ---
 
-*Last Updated: 2026-01-12*
-*Project Version: 1.0*
+*Last Updated: 2026-02-04*
+*Project Version: 1.1*
 *OpenCV Version: 4.8.0*
-*TFLite Model: SSD MobileNet (COCO)*
+*Current Detection Model: SSD MobileNet v1 (detect.tflite) — quantized uint8, 300x300 input*
+*Next Detection Model: EfficientDet-Lite0 via MediaPipe Tasks (efficientdet_lite0.tflite already in assets)*
