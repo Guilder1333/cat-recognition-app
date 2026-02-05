@@ -1,6 +1,5 @@
 package com.example.catrecognitionsystem.ml
 
-import android.graphics.Bitmap
 import android.graphics.RectF
 import com.example.catrecognitionsystem.tracking.TrackedCat
 import com.example.catrecognitionsystem.tracking.TrackingMode
@@ -15,7 +14,6 @@ data class DetectionResult(
 )
 
 data class CatDetectionState(
-    val capturedImage: Bitmap? = null,
     val detections: List<DetectionResult> = emptyList(),
     val hasCats: Boolean = false,
     val isProcessing: Boolean = false,

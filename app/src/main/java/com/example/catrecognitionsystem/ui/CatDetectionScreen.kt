@@ -3,7 +3,6 @@ package com.example.catrecognitionsystem.ui
 import android.graphics.Bitmap
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -12,27 +11,21 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
-import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.lifecycle.LifecycleOwner
 import com.example.catrecognitionsystem.camera.CameraManager
 import com.example.catrecognitionsystem.ml.CatDetectionState
 import com.example.catrecognitionsystem.ml.CatDetector
-import com.example.catrecognitionsystem.ml.DetectionResult
 import com.example.catrecognitionsystem.tracking.MultiCatTrackingManager
 import com.example.catrecognitionsystem.tracking.TrackedCat
 import com.example.catrecognitionsystem.tracking.TrackingMode
 import com.example.catrecognitionsystem.tracking.ValidationStatus
 import com.example.catrecognitionsystem.utils.CatColorAnalyzer
+import com.example.catrecognitionsystem.utils.MotionDetector
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -42,38 +35,38 @@ fun CatDetectionScreen(
     cameraManager: CameraManager,
     catDetector: CatDetector
 ) {
-    val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
 
     var detectionState by remember { mutableStateOf(CatDetectionState()) }
     var previewView by remember { mutableStateOf<PreviewView?>(null) }
 
-    // Tracking manager and state
     val trackingManager = remember { MultiCatTrackingManager() }
-    var isTrackingActive by remember { mutableStateOf(false) }
-    var selectedCatColor by remember { mutableStateOf<CatColorAnalyzer.CatColor?>(null) }
-    var isWaitingForFirstFrame by remember { mutableStateOf(false) }
-    var firstFrameForTracking by remember { mutableStateOf<Bitmap?>(null) }
+    val motionDetector = remember { MotionDetector() }
 
-    // Initialize camera when previewView is available or tracking state changes
-    LaunchedEffect(previewView, isTrackingActive, isWaitingForFirstFrame) {
-        android.util.Log.d("CatDetectionScreen", "LaunchedEffect triggered - previewView: ${previewView != null}, isTracking: $isTrackingActive, isWaiting: $isWaitingForFirstFrame")
+    // Master on/off for the detection loop
+    var isRunning by remember { mutableStateOf(false) }
+    // True while OpenCV is actively tracking a cat; false while scanning for motion
+    var isTrackingActive by remember { mutableStateOf(false) }
+    // Gate: true while ML detection is in flight — prevents re-entry
+    var isDetectionInProgress by remember { mutableStateOf(false) }
+    // Color filter chosen by the user before / during monitoring
+    var selectedCatColor by remember { mutableStateOf<CatColorAnalyzer.CatColor?>(null) }
+
+    // Bind camera.  Re-runs only when isRunning or previewView changes.
+    // isTrackingActive / isDetectionInProgress are Compose state vars; the callback
+    // reads their current value at each invocation without needing a rebind.
+    LaunchedEffect(previewView, isRunning) {
+        android.util.Log.d("CatDetectionScreen", "LaunchedEffect triggered - previewView: ${previewView != null}, isRunning: $isRunning")
         previewView?.let { view ->
             try {
-                android.util.Log.d("CatDetectionScreen", "Binding camera with analysis: ${isTrackingActive || isWaitingForFirstFrame}")
                 cameraManager.bindCamera(
                     lifecycleOwner = lifecycleOwner,
                     previewView = view,
-                    enableAnalysis = isTrackingActive || isWaitingForFirstFrame,
-                    onFrameCallback = if (isTrackingActive || isWaitingForFirstFrame) { bitmap ->
-                        android.util.Log.d("CatDetectionScreen", "Frame callback invoked - isWaiting: $isWaitingForFirstFrame, firstFrame: ${firstFrameForTracking == null}, isTracking: $isTrackingActive")
-                        if (isWaitingForFirstFrame && firstFrameForTracking == null) {
-                            // Capture first frame for initialization
-                            android.util.Log.d("CatDetectionScreen", "Captured first frame for tracking: ${bitmap.width}x${bitmap.height}")
-                            firstFrameForTracking = bitmap.copy(Bitmap.Config.ARGB_8888, false)
-                        } else if (isTrackingActive) {
-                            // Process tracking frames
+                    enableAnalysis = isRunning,
+                    onFrameCallback = if (isRunning) { bitmap ->
+                        if (isTrackingActive) {
+                            // ── TRACKING MODE ──────────────────────────────
                             scope.launch(Dispatchers.Default) {
                                 processTrackingFrame(
                                     bitmap = bitmap,
@@ -82,90 +75,77 @@ fun CatDetectionScreen(
                                     currentState = detectionState,
                                     onStateUpdate = { detectionState = it },
                                     onTrackingLost = {
-                                        // Handle definitive tracking loss - auto-stop tracking
-                                        scope.launch {
-                                            stopTracking(
-                                                trackingManager = trackingManager,
-                                                onStateUpdate = { detectionState = it },
-                                                onTrackingStopped = {
-                                                    isTrackingActive = false
-                                                    isWaitingForFirstFrame = false
-                                                    firstFrameForTracking = null
-                                                }
-                                            )
+                                        // Back to monitoring — do NOT stop isRunning
+                                        isTrackingActive = false
+                                        motionDetector.reset()
+                                        detectionState = CatDetectionState(
+                                            errorMessage = "Cat lost, resuming motion monitoring"
+                                        )
+                                        scope.launch(Dispatchers.Default) {
+                                            trackingManager.clearAllTrackers()
                                         }
+                                        android.util.Log.d("CatDetectionScreen", "Tracking lost, back to monitoring")
                                     }
                                 )
                             }
+                        } else if (!isDetectionInProgress) {
+                            // ── MONITORING MODE ────────────────────────────
+                            if (motionDetector.detectMotion(bitmap)) {
+                                android.util.Log.d("CatDetectionScreen", "Motion detected, running cat detection")
+                                isDetectionInProgress = true
+                                // Snapshot the color choice on the main thread before dispatching
+                                val colorForTracking = selectedCatColor
+
+                                scope.launch(Dispatchers.Default) {
+                                    try {
+                                        trackingManager.setTargetColor(colorForTracking)
+                                        val detections = catDetector.detectCats(bitmap)
+                                        android.util.Log.d("CatDetectionScreen", "Detection after motion: ${detections.size} cats found")
+
+                                        if (detections.isNotEmpty()) {
+                                            val trackedCats = trackingManager.initializeTracking(bitmap, detections)
+                                            if (trackedCats.isNotEmpty()) {
+                                                withContext(Dispatchers.Main) {
+                                                    detectionState = CatDetectionState(
+                                                        detections = detections,
+                                                        hasCats = true,
+                                                        trackingMode = TrackingMode.ActiveTracking(trackedCats, 0),
+                                                        trackedCats = trackedCats,
+                                                        debugInfo = catDetector.lastDebugInfo
+                                                    )
+                                                    isTrackingActive = true
+                                                    isDetectionInProgress = false
+                                                }
+                                                android.util.Log.d("CatDetectionScreen", "Cat found after motion, tracking started")
+                                                return@launch
+                                            }
+                                        }
+
+                                        // No cat (or filtered out) — stay in monitoring
+                                        withContext(Dispatchers.Main) {
+                                            detectionState = detectionState.copy(
+                                                debugInfo = catDetector.lastDebugInfo,
+                                                errorMessage = null
+                                            )
+                                            isDetectionInProgress = false
+                                        }
+                                    } catch (e: Exception) {
+                                        android.util.Log.e("CatDetectionScreen", "Detection error after motion", e)
+                                        withContext(Dispatchers.Main) {
+                                            isDetectionInProgress = false
+                                        }
+                                    }
+                                }
+                            }
                         }
+                        // else: detection in progress, skip this frame
                     } else null
                 )
                 android.util.Log.d("CatDetectionScreen", "Camera bound successfully")
             } catch (e: Exception) {
                 android.util.Log.e("CatDetectionScreen", "Camera binding failed", e)
-                detectionState = detectionState.copy(
-                    errorMessage = "Camera initialization failed: ${e.message}"
-                )
+                detectionState = detectionState.copy(errorMessage = "Camera initialization failed: ${e.message}")
             }
-        }
-    }
-
-    // Process first frame when it becomes available
-    LaunchedEffect(firstFrameForTracking) {
-        firstFrameForTracking?.let { bitmap ->
-            android.util.Log.d("CatDetectionScreen", "Processing first frame for tracking initialization")
-
-            // Run detection on first frame
-            val detections = withContext(Dispatchers.Default) {
-                catDetector.detectCats(bitmap)
-            }
-
-            android.util.Log.d("CatDetectionScreen", "First frame detection found ${detections.size} cats")
-
-            if (detections.isEmpty()) {
-                detectionState = CatDetectionState(
-                    isProcessing = false,
-                    errorMessage = "No cats detected. Please ensure a cat is visible.",
-                    debugInfo = catDetector.lastDebugInfo
-                )
-                isWaitingForFirstFrame = false
-                firstFrameForTracking = null
-                return@LaunchedEffect
-            }
-
-            // Initialize tracking with first frame
-            val trackedCats = withContext(Dispatchers.Default) {
-                trackingManager.initializeTracking(bitmap, detections)
-            }
-
-            if (trackedCats.isEmpty()) {
-                detectionState = CatDetectionState(
-                    isProcessing = false,
-                    errorMessage = "No cats of the selected color detected. Try changing the color filter.",
-                    debugInfo = catDetector.lastDebugInfo
-                )
-                isWaitingForFirstFrame = false
-                firstFrameForTracking = null
-                return@LaunchedEffect
-            }
-
-            // Successfully initialized - switch to active tracking
-            detectionState = CatDetectionState(
-                capturedImage = null,
-                detections = detections,
-                hasCats = true,
-                isProcessing = false,
-                errorMessage = null,
-                trackingMode = TrackingMode.ActiveTracking(trackedCats, 0),
-                trackedCats = trackedCats,
-                debugInfo = catDetector.lastDebugInfo
-            )
-
-            isWaitingForFirstFrame = false
-            isTrackingActive = true
-            firstFrameForTracking = null
-
-            android.util.Log.d("CatDetectionScreen", "Tracking initialized successfully")
         }
     }
 
@@ -183,64 +163,43 @@ fun CatDetectionScreen(
             modifier = Modifier.padding(vertical = 8.dp)
         )
 
-        // Camera preview or captured image
+        // Camera preview (always visible) + tracking overlay + spinner
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f)
         ) {
-            if (isTrackingActive) {
-                // Display camera preview with live tracking overlay
-                AndroidView(
-                    factory = { ctx ->
-                        PreviewView(ctx).also { view ->
-                            previewView = view
-                        }
-                    },
-                    modifier = Modifier.fillMaxSize()
-                )
+            AndroidView(
+                factory = { ctx ->
+                    PreviewView(ctx).also { previewView = it }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
 
-                // Tracking overlay on top of camera preview
-                if (detectionState.trackedCats.isNotEmpty()) {
-                    TrackingOverlay(
-                        trackedCats = detectionState.trackedCats,
-                        modifier = Modifier.fillMaxSize()
-                    )
-                }
-            } else if (detectionState.capturedImage != null) {
-                // Display captured image with bounding boxes (single-shot mode)
-                ImageWithBoundingBoxes(
-                    bitmap = detectionState.capturedImage!!,
-                    detections = detectionState.detections
-                )
-            } else {
-                // Display camera preview
-                AndroidView(
-                    factory = { ctx ->
-                        PreviewView(ctx).also { view ->
-                            previewView = view
-                        }
-                    },
+            if (isTrackingActive && detectionState.trackedCats.isNotEmpty()) {
+                TrackingOverlay(
+                    trackedCats = detectionState.trackedCats,
                     modifier = Modifier.fillMaxSize()
                 )
             }
 
-            // Loading indicator
-            if (detectionState.isProcessing) {
+            if (isDetectionInProgress) {
                 CircularProgressIndicator(
                     modifier = Modifier.align(Alignment.Center)
                 )
             }
         }
 
-        // Detection results
+        // Status card
         DetectionResultsCard(
             state = detectionState,
             trackingColor = selectedCatColor,
-            isTracking = isTrackingActive
+            isTracking = isTrackingActive,
+            isRunning = isRunning,
+            isDetectionInProgress = isDetectionInProgress
         )
 
-        // Cat color filter selection
+        // Color filter — visible whenever we are not actively tracking
         if (!isTrackingActive) {
             Card(
                 modifier = Modifier.fillMaxWidth()
@@ -281,67 +240,33 @@ fun CatDetectionScreen(
             }
         }
 
-        // Action buttons
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        // Single Start / Stop button
+        Button(
+            onClick = {
+                if (!isRunning) {
+                    trackingManager.setTargetColor(selectedCatColor)
+                    motionDetector.reset()
+                    isRunning = true
+                    isTrackingActive = false
+                    isDetectionInProgress = false
+                    detectionState = CatDetectionState()
+                    android.util.Log.d("CatDetectionScreen", "Detection started, monitoring for motion")
+                } else {
+                    // Stop everything
+                    isRunning = false
+                    isTrackingActive = false
+                    isDetectionInProgress = false
+                    motionDetector.reset()
+                    detectionState = CatDetectionState()
+                    scope.launch(Dispatchers.Default) {
+                        trackingManager.clearAllTrackers()
+                    }
+                    android.util.Log.d("CatDetectionScreen", "Detection stopped")
+                }
+            },
+            modifier = Modifier.fillMaxWidth()
         ) {
-            Button(
-                onClick = {
-                    if (!isTrackingActive && !isWaitingForFirstFrame) {
-                        // Set target color on tracking manager
-                        trackingManager.setTargetColor(selectedCatColor)
-
-                        // Start waiting for first frame
-                        detectionState = CatDetectionState(isProcessing = true)
-                        isWaitingForFirstFrame = true
-                        firstFrameForTracking = null
-                        android.util.Log.d("CatDetectionScreen", "Starting tracking - waiting for first frame")
-                    } else if (isTrackingActive) {
-                        // Stop tracking
-                        scope.launch {
-                            stopTracking(
-                                trackingManager = trackingManager,
-                                onStateUpdate = { detectionState = it },
-                                onTrackingStopped = {
-                                    isTrackingActive = false
-                                    isWaitingForFirstFrame = false
-                                    firstFrameForTracking = null
-                                }
-                            )
-                        }
-                    }
-                },
-                modifier = Modifier.weight(1f),
-                enabled = !detectionState.isProcessing
-            ) {
-                Text(if (isTrackingActive) "Stop Tracking" else "Start Tracking")
-            }
-
-            Button(
-                onClick = {
-                    scope.launch {
-                        if (!isTrackingActive) {
-                            // Single-shot mode
-                            captureAndDetect(
-                                cameraManager = cameraManager,
-                                catDetector = catDetector,
-                                onStateUpdate = { detectionState = it }
-                            )
-                        } else {
-                            // Clear while tracking mode active
-                            detectionState = CatDetectionState(
-                                trackingMode = detectionState.trackingMode,
-                                trackedCats = detectionState.trackedCats
-                            )
-                        }
-                    }
-                },
-                modifier = Modifier.weight(1f),
-                enabled = !detectionState.isProcessing
-            ) {
-                Text(if (isTrackingActive) "Capture" else "Clear")
-            }
+            Text(if (isRunning) "Stop Detection" else "Start Detection")
         }
 
         // Error message
@@ -360,111 +285,17 @@ fun CatDetectionScreen(
             }
         }
 
-        // Debug info card
-        if (detectionState.debugInfo != null) {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant
-                )
-            ) {
-                Text(
-                    text = detectionState.debugInfo!!,
-                    modifier = Modifier.padding(8.dp),
-                    style = MaterialTheme.typography.bodySmall,
-                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-                    fontSize = 10.sp
-                )
-            }
-        }
     }
 }
 
 @Composable
-fun ImageWithBoundingBoxes(
-    bitmap: Bitmap,
-    detections: List<DetectionResult>
+fun DetectionResultsCard(
+    state: CatDetectionState,
+    trackingColor: CatColorAnalyzer.CatColor? = null,
+    isTracking: Boolean = false,
+    isRunning: Boolean = false,
+    isDetectionInProgress: Boolean = false
 ) {
-    var imageSize by remember { mutableStateOf(IntSize.Zero) }
-
-    Box(
-        modifier = Modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center
-    ) {
-        Image(
-            bitmap = bitmap.asImageBitmap(),
-            contentDescription = "Captured image",
-            modifier = Modifier
-                .fillMaxSize()
-                .onSizeChanged { imageSize = it },
-            contentScale = ContentScale.Fit
-        )
-
-        // Draw bounding boxes
-        if (imageSize.width > 0 && imageSize.height > 0) {
-            Canvas(modifier = Modifier.fillMaxSize()) {
-                // Calculate the actual image display size
-                val imageAspectRatio = bitmap.width.toFloat() / bitmap.height.toFloat()
-                val canvasAspectRatio = size.width / size.height
-
-                val displayWidth: Float
-                val displayHeight: Float
-                val offsetX: Float
-                val offsetY: Float
-
-                if (canvasAspectRatio > imageAspectRatio) {
-                    // Canvas is wider than image
-                    displayHeight = size.height
-                    displayWidth = displayHeight * imageAspectRatio
-                    offsetX = (size.width - displayWidth) / 2
-                    offsetY = 0f
-                } else {
-                    // Canvas is taller than image
-                    displayWidth = size.width
-                    displayHeight = displayWidth / imageAspectRatio
-                    offsetX = 0f
-                    offsetY = (size.height - displayHeight) / 2
-                }
-
-                // Draw each detection
-                detections.forEach { detection ->
-                    // Convert normalized coordinates to pixel coordinates
-                    val left = offsetX + detection.boundingBox.left * displayWidth
-                    val top = offsetY + detection.boundingBox.top * displayHeight
-                    val right = offsetX + detection.boundingBox.right * displayWidth
-                    val bottom = offsetY + detection.boundingBox.bottom * displayHeight
-
-                    // Draw rectangle
-                    drawRect(
-                        color = Color.Green,
-                        topLeft = Offset(left, top),
-                        size = Size(right - left, bottom - top),
-                        style = Stroke(width = 4f)
-                    )
-
-                    // Draw label with color
-                    val colorName = CatColorAnalyzer.getColorName(detection.color)
-                    val label = "$colorName Cat ${(detection.confidence * 100).toInt()}%"
-                    val paint = android.graphics.Paint().apply {
-                        color = android.graphics.Color.GREEN
-                        textSize = 48f
-                        isAntiAlias = true
-                    }
-
-                    drawContext.canvas.nativeCanvas.drawText(
-                        label,
-                        left,
-                        maxOf(top - 10f, 50f),
-                        paint
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun DetectionResultsCard(state: CatDetectionState, trackingColor: CatColorAnalyzer.CatColor? = null, isTracking: Boolean = false) {
     Card(
         modifier = Modifier.fillMaxWidth()
     ) {
@@ -472,34 +303,38 @@ fun DetectionResultsCard(state: CatDetectionState, trackingColor: CatColorAnalyz
             modifier = Modifier.padding(16.dp)
         ) {
             Text(
-                text = if (isTracking) "Tracking Status" else "Detection Results",
+                text = when {
+                    isTracking -> "Tracking Status"
+                    isRunning  -> "Monitoring"
+                    else       -> "Detection"
+                },
                 style = MaterialTheme.typography.titleMedium,
                 modifier = Modifier.padding(bottom = 8.dp)
             )
 
-            // Show tracking color filter if set
-            if (trackingColor != null && isTracking) {
-                Text(
-                    text = "Tracking: ${CatColorAnalyzer.getColorName(trackingColor)} cats only",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.padding(bottom = 4.dp)
-                )
-            }
-
             if (isTracking && state.trackedCats.isNotEmpty()) {
+                // ── Active tracking display ─────────────────────────
+                if (trackingColor != null) {
+                    Text(
+                        text = "Tracking: ${CatColorAnalyzer.getColorName(trackingColor)} cats only",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(bottom = 4.dp)
+                    )
+                }
+
                 val cat = state.trackedCats.first()
                 val colorName = CatColorAnalyzer.getColorName(cat.lockedColor)
 
                 val statusText = when (cat.validationStatus) {
-                    ValidationStatus.VALID -> "Tracking active"
-                    ValidationStatus.UNCERTAIN -> "Tracking uncertain (${cat.consecutiveValidationFailures} checks failed)"
-                    ValidationStatus.INVALID -> "Tracking lost"
+                    ValidationStatus.VALID      -> "Tracking active"
+                    ValidationStatus.UNCERTAIN  -> "Tracking uncertain (${cat.consecutiveValidationFailures} checks failed)"
+                    ValidationStatus.INVALID    -> "Tracking lost"
                 }
                 val statusColor = when (cat.validationStatus) {
-                    ValidationStatus.VALID -> Color.Green
-                    ValidationStatus.UNCERTAIN -> Color.Yellow
-                    ValidationStatus.INVALID -> Color.Red
+                    ValidationStatus.VALID      -> Color.Green
+                    ValidationStatus.UNCERTAIN  -> Color.Yellow
+                    ValidationStatus.INVALID    -> Color.Red
                 }
 
                 Text(
@@ -515,7 +350,6 @@ fun DetectionResultsCard(state: CatDetectionState, trackingColor: CatColorAnalyz
                     style = MaterialTheme.typography.bodyMedium
                 )
 
-                // Show validation info when not valid
                 if (cat.validationStatus != ValidationStatus.VALID) {
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
@@ -524,38 +358,25 @@ fun DetectionResultsCard(state: CatDetectionState, trackingColor: CatColorAnalyz
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-            } else if (state.capturedImage == null && !isTracking) {
-                Text(
-                    text = "No image captured yet. Press 'Start Tracking' to begin.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            } else if (state.isProcessing) {
-                Text(
-                    text = "Processing image...",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            } else if (state.hasCats && !isTracking) {
-                Text(
-                    text = "Cat detected! Found ${state.detections.size} cat(s)",
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = Color.Green
-                )
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                state.detections.forEachIndexed { index, detection ->
-                    val colorName = CatColorAnalyzer.getColorName(detection.color)
-                    Text(
-                        text = "$colorName Cat ${index + 1}: ${(detection.confidence * 100).toInt()}% confidence",
-                        style = MaterialTheme.typography.bodyMedium
-                    )
+            } else if (isRunning) {
+                // ── Monitoring / detection-in-progress display ───────
+                val statusText = if (isDetectionInProgress) {
+                    "Motion detected, checking for cats..."
+                } else {
+                    "Monitoring for motion..."
                 }
-            } else if (!isTracking) {
+                val statusColor = if (isDetectionInProgress) Color.Yellow else Color(0xFF00BCD4)
+
                 Text(
-                    text = "No cats detected in the image",
+                    text = statusText,
                     style = MaterialTheme.typography.bodyLarge,
+                    color = statusColor
+                )
+            } else {
+                // ── Idle ─────────────────────────────────────────────
+                Text(
+                    text = "Press 'Start Detection' to begin.",
+                    style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
@@ -570,25 +391,22 @@ fun TrackingOverlay(
 ) {
     Canvas(modifier = modifier) {
         trackedCats.forEach { cat ->
-            // Convert normalized coordinates to canvas coordinates
-            val left = cat.boundingBox.left * size.width
-            val top = cat.boundingBox.top * size.height
-            val right = cat.boundingBox.right * size.width
+            val left   = cat.boundingBox.left   * size.width
+            val top    = cat.boundingBox.top    * size.height
+            val right  = cat.boundingBox.right  * size.width
             val bottom = cat.boundingBox.bottom * size.height
 
-            // Choose color based on validation status
             val color = when (cat.validationStatus) {
-                ValidationStatus.VALID -> cat.displayColor
-                ValidationStatus.UNCERTAIN -> Color.Yellow
-                ValidationStatus.INVALID -> Color.Red
+                ValidationStatus.VALID      -> cat.displayColor
+                ValidationStatus.UNCERTAIN  -> Color.Yellow
+                ValidationStatus.INVALID    -> Color.Red
             }
             val strokeWidth = when (cat.validationStatus) {
-                ValidationStatus.VALID -> 4f
-                ValidationStatus.UNCERTAIN -> 5f
-                ValidationStatus.INVALID -> 6f
+                ValidationStatus.VALID      -> 4f
+                ValidationStatus.UNCERTAIN  -> 5f
+                ValidationStatus.INVALID    -> 6f
             }
 
-            // Draw bounding box
             drawRect(
                 color = color,
                 topLeft = Offset(left, top),
@@ -596,20 +414,19 @@ fun TrackingOverlay(
                 style = Stroke(width = strokeWidth)
             )
 
-            // Draw label using locked color (not current detection color)
             val colorName = CatColorAnalyzer.getColorName(cat.lockedColor)
             val confidenceText = "${(cat.confidence * 100).toInt()}%"
             val statusIndicator = when (cat.validationStatus) {
-                ValidationStatus.VALID -> ""
-                ValidationStatus.UNCERTAIN -> " [?]"
-                ValidationStatus.INVALID -> " [LOST]"
+                ValidationStatus.VALID      -> ""
+                ValidationStatus.UNCERTAIN  -> " [?]"
+                ValidationStatus.INVALID    -> " [LOST]"
             }
             val label = "$colorName $confidenceText$statusIndicator"
 
             val textColor = when (cat.validationStatus) {
-                ValidationStatus.VALID -> android.graphics.Color.WHITE
-                ValidationStatus.UNCERTAIN -> android.graphics.Color.YELLOW
-                ValidationStatus.INVALID -> android.graphics.Color.RED
+                ValidationStatus.VALID      -> android.graphics.Color.WHITE
+                ValidationStatus.UNCERTAIN  -> android.graphics.Color.YELLOW
+                ValidationStatus.INVALID    -> android.graphics.Color.RED
             }
 
             val paint = android.graphics.Paint().apply {
@@ -629,102 +446,6 @@ fun TrackingOverlay(
     }
 }
 
-private suspend fun startTracking(
-    cameraManager: CameraManager,
-    catDetector: CatDetector,
-    trackingManager: MultiCatTrackingManager,
-    onStateUpdate: (CatDetectionState) -> Unit,
-    onTrackingStarted: () -> Unit
-) {
-    // Set processing state
-    onStateUpdate(CatDetectionState(isProcessing = true))
-
-    try {
-        android.util.Log.d("CatDetectionScreen", "Starting tracking - capturing initial frame")
-
-        // Capture initial frame
-        val bitmap = withContext(Dispatchers.Main) {
-            cameraManager.captureImage()
-        }
-
-        if (bitmap == null) {
-            android.util.Log.e("CatDetectionScreen", "Failed to capture initial frame")
-            onStateUpdate(CatDetectionState(
-                isProcessing = false,
-                errorMessage = "Failed to capture image"
-            ))
-            return
-        }
-
-        android.util.Log.d("CatDetectionScreen", "Captured frame: ${bitmap.width}x${bitmap.height}")
-
-        // Run initial detection
-        val detections = withContext(Dispatchers.Default) {
-            catDetector.detectCats(bitmap)
-        }
-
-        android.util.Log.d("CatDetectionScreen", "Initial detection found ${detections.size} cats")
-
-        if (detections.isEmpty()) {
-            onStateUpdate(CatDetectionState(
-                isProcessing = false,
-                errorMessage = "No cats detected. Please ensure a cat is visible."
-            ))
-            return
-        }
-
-        // Initialize tracking (this will filter by color internally)
-        val trackedCats = withContext(Dispatchers.Default) {
-            trackingManager.initializeTracking(bitmap, detections)
-        }
-
-        if (trackedCats.isEmpty()) {
-            onStateUpdate(CatDetectionState(
-                isProcessing = false,
-                errorMessage = "No cats of the selected color detected. Try changing the color filter."
-            ))
-            return
-        }
-
-        // Update state
-        onStateUpdate(CatDetectionState(
-            capturedImage = null,
-            detections = detections,
-            hasCats = true,
-            isProcessing = false,
-            errorMessage = null,
-            trackingMode = TrackingMode.ActiveTracking(trackedCats, 0),
-            trackedCats = trackedCats
-        ))
-
-        // Enable tracking
-        onTrackingStarted()
-
-    } catch (e: Exception) {
-        onStateUpdate(CatDetectionState(
-            isProcessing = false,
-            errorMessage = "Error starting tracking: ${e.message}"
-        ))
-    }
-}
-
-private suspend fun stopTracking(
-    trackingManager: MultiCatTrackingManager,
-    onStateUpdate: (CatDetectionState) -> Unit,
-    onTrackingStopped: () -> Unit
-) {
-    withContext(Dispatchers.Default) {
-        trackingManager.clearAllTrackers()
-    }
-
-    onStateUpdate(CatDetectionState(
-        trackingMode = TrackingMode.Idle,
-        trackedCats = emptyList()
-    ))
-
-    onTrackingStopped()
-}
-
 private suspend fun processTrackingFrame(
     bitmap: Bitmap,
     trackingManager: MultiCatTrackingManager,
@@ -739,53 +460,44 @@ private suspend fun processTrackingFrame(
 
         android.util.Log.d("CatDetectionScreen", "Processing tracking frame: ${bitmap.width}x${bitmap.height}, tracked cats: ${currentCats.size}")
 
-        // Check if we should run validation (time-based or frame-based)
         val shouldValidate = trackingManager.shouldRunDetection() ||
                              trackingManager.shouldRunValidation(currentCat)
 
         if (shouldValidate) {
             android.util.Log.d("CatDetectionScreen", "Running periodic detection/validation")
 
-            // Run detection
             val detections = catDetector.detectCats(bitmap)
             android.util.Log.d("CatDetectionScreen", "Periodic detection found ${detections.size} cats")
 
-            // Merge with tracking and validate
             val validationResult = trackingManager.mergeDetectionsWithTracking(
                 bitmap, detections, currentCats
             )
 
             android.util.Log.d("CatDetectionScreen", "Validation result: passed=${validationResult.validationPassed}, shouldStop=${validationResult.shouldStopTracking}")
 
-            // Check for definitive tracking loss
             if (validationResult.shouldStopTracking) {
-                android.util.Log.w("CatDetectionScreen", "TRACKING DEFINITIVELY LOST - auto-stopping tracking")
+                android.util.Log.w("CatDetectionScreen", "TRACKING LOST - returning to motion monitoring")
                 withContext(Dispatchers.Main) {
-                    onStateUpdate(currentState.copy(
-                        trackedCats = listOf(validationResult.updatedCat),
-                        errorMessage = "Tracking stopped: Cat no longer detected at tracking location"
-                    ))
                     onTrackingLost()
                 }
                 return
             }
 
-            // Update state with validation result
             withContext(Dispatchers.Main) {
                 onStateUpdate(currentState.copy(
                     trackedCats = listOf(validationResult.updatedCat),
-                    hasCats = true
+                    hasCats = true,
+                    debugInfo = catDetector.lastDebugInfo
                 ))
             }
         } else {
-            // Just update tracking (no validation)
+            // Just update tracker position — no ML
             val updatedCats = trackingManager.processFrame(bitmap, currentCats)
 
             if (updatedCats.size != currentCats.size || updatedCats.firstOrNull()?.isLost != currentCats.firstOrNull()?.isLost) {
                 android.util.Log.d("CatDetectionScreen", "Tracking update: ${updatedCats.size} cats, lost: ${updatedCats.firstOrNull()?.isLost}")
             }
 
-            // Update state
             withContext(Dispatchers.Main) {
                 onStateUpdate(currentState.copy(
                     trackedCats = updatedCats,
@@ -801,54 +513,5 @@ private suspend fun processTrackingFrame(
                 errorMessage = "Tracking error: ${e.message}"
             ))
         }
-    }
-}
-
-private suspend fun captureAndDetect(
-    cameraManager: CameraManager,
-    catDetector: CatDetector,
-    onStateUpdate: (CatDetectionState) -> Unit
-) {
-    // Set processing state
-    onStateUpdate(CatDetectionState(isProcessing = true))
-
-    try {
-        // Capture image
-        val bitmap = withContext(Dispatchers.Main) {
-            cameraManager.captureImage()
-        }
-
-        if (bitmap == null) {
-            onStateUpdate(
-                CatDetectionState(
-                    isProcessing = false,
-                    errorMessage = "Failed to capture image"
-                )
-            )
-            return
-        }
-
-        // Run detection on background thread
-        val detections = withContext(Dispatchers.Default) {
-            catDetector.detectCats(bitmap)
-        }
-
-        // Update state with results
-        onStateUpdate(
-            CatDetectionState(
-                capturedImage = bitmap,
-                detections = detections,
-                hasCats = detections.isNotEmpty(),
-                isProcessing = false,
-                errorMessage = null
-            )
-        )
-    } catch (e: Exception) {
-        onStateUpdate(
-            CatDetectionState(
-                isProcessing = false,
-                errorMessage = "Error: ${e.message}"
-            )
-        )
     }
 }

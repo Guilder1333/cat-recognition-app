@@ -19,7 +19,9 @@
       "Bash(.gradlew :app:dependencies:*)",
       "Bash(gradlew.bat:*)",
       "Bash(ls:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(.gradlew.bat assembleDebug:*)",
+      "Bash(gradle assembleDebug:*)"
     ]
   }
 }
