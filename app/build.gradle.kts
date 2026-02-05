@@ -65,10 +65,8 @@ dependencies {
     implementation(libs.androidx.camera.lifecycle)
     implementation(libs.androidx.camera.view)
 
-    // TensorFlow Lite
-    implementation(libs.tensorflow.lite)
-    implementation(libs.tensorflow.lite.support)
-    implementation(libs.tensorflow.lite.metadata)
+    // MediaPipe Tasks (object detection)
+    implementation(libs.mediapipe.tasks.vision)
 
     // Image loading
     implementation(libs.coil.compose)

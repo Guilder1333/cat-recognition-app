@@ -15,7 +15,11 @@
       "Bash(gradlew.bat assembleDebug:*)",
       "Bash(cmd /c \"gradlew.bat assembleDebug\")",
       "Bash(./gradlew.bat assembleDebug:*)",
-      "Bash(powershell -Command \"\\(Get-Item ''C:\\\\workspace\\\\cat-recognition-app\\\\app\\\\src\\\\main\\\\assets\\\\efficientdet_lite0.tflite''\\).Length\")"
+      "Bash(powershell -Command \"\\(Get-Item ''C:\\\\workspace\\\\cat-recognition-app\\\\app\\\\src\\\\main\\\\assets\\\\efficientdet_lite0.tflite''\\).Length\")",
+      "Bash(.gradlew :app:dependencies:*)",
+      "Bash(gradlew.bat:*)",
+      "Bash(ls:*)",
+      "Bash(python3:*)"
     ]
   }
 }
