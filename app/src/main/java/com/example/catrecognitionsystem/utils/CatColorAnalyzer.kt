@@ -6,6 +6,7 @@ import android.graphics.RectF
 import android.util.Log
 import kotlin.math.max
 import kotlin.math.min
+import androidx.core.graphics.get
 
 object CatColorAnalyzer {
 
@@ -67,7 +68,7 @@ object CatColorAnalyzer {
             for (y in innerTop until innerBottom step step) {
                 for (x in innerLeft until innerRight step step) {
                     if (x < bitmap.width && y < bitmap.height) {
-                        samples.add(bitmap.getPixel(x, y))
+                        samples.add(bitmap[x, y])
                     }
                 }
             }
@@ -161,7 +162,7 @@ object CatColorAnalyzer {
         for (y in top until bottom step step) {
             for (x in left until right step step) {
                 if (x < bitmap.width && y < bitmap.height) {
-                    samples.add(bitmap.getPixel(x, y))
+                    samples.add(bitmap[x, y])
                 }
             }
         }

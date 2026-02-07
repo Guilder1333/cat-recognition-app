@@ -102,7 +102,7 @@ class CatTracker(
         val area = (normalizedBox.right - normalizedBox.left) *
                    (normalizedBox.bottom - normalizedBox.top)
 
-        if (area < 0.01f || area > 0.8f) {
+        if (area !in 0.01f..0.8f) {
             return 0.5f
         }
 

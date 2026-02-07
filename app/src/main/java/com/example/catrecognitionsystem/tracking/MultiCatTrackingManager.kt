@@ -39,7 +39,6 @@ class MultiCatTrackingManager(
 
     companion object {
         private const val TAG = "MultiCatTrackingManager"
-        private const val IOU_THRESHOLD = 0.3f
         private const val VALIDATION_IOU_THRESHOLD = 0.2f  // Slightly lower for validation
         private const val VALIDATION_FAILURE_THRESHOLD = 3  // Stop after 3 consecutive failures
     }

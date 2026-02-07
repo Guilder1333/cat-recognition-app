@@ -133,9 +133,9 @@ class CatDetector(context: Context) {
 
                 // Normalize pixel coordinates to [0, 1]
                 var left = (box.left / imageWidth).coerceIn(0f, 1f)
-                var top = (box.top / imageHeight).coerceIn(0f, 1f)
+                val top = (box.top / imageHeight).coerceIn(0f, 1f)
                 var right = (box.right / imageWidth).coerceIn(0f, 1f)
-                var bottom = (box.bottom / imageHeight).coerceIn(0f, 1f)
+                val bottom = (box.bottom / imageHeight).coerceIn(0f, 1f)
 
                 // Flip bounding box back if image was flipped
                 if (isFlipped) {
