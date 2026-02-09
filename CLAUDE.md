@@ -338,6 +338,28 @@ MultiCatTrackingManager: Running periodic detection (every 30 frames)
    - TrackerCSRT is in `org.opencv.tracking` package, not available in base OpenCV build
    - Would need to either build from source with contrib or use third-party dependency like `com.quickbirdstudios:opencv-contrib`
 
+**Alternative: Sparse Optical Flow (Point Tracking) instead of TrackerMIL**
+
+Replace rectangle-based TrackerMIL with Lucas-Kanade sparse optical flow tracking individual feature points on the cat. All required functions are in base OpenCV 4.8.0 (no contrib needed).
+
+**How it would work:**
+1. Detection finds cat → `Imgproc.goodFeaturesToTrack()` extracts ~20-30 Shi-Tomasi corners inside the bounding box
+2. Each frame: `Video.calcOpticalFlowPyrLK()` tracks those points → derive bounding box from the point cloud
+3. Points that diverge from the cluster (e.g., drift onto floor) are detected as outliers and discarded
+4. When too many points are lost (below a minimum threshold), trigger re-detection
+
+**Advantages over TrackerMIL:**
+- No silent drift — each point has a tracking status/error; failed points are explicitly detected
+- Natural outlier rejection — a point that jumps to floor diverges from the cluster and gets filtered
+- Self-aware quality signal — number of remaining good points indicates tracking health
+- Faster — LK optical flow is lighter than TrackerMIL
+
+**Concern: black cats** — uniform dark fur has very few corners/edges. Feature detection may only find silhouette points (ears, outline against background), which are fewer and more fragile. Mitigations:
+- Lower `qualityLevel` in `goodFeaturesToTrack()` to accept weaker features
+- Silhouette/edge points (ears, head outline) are still trackable, just fewer
+- Fall back to re-detection sooner when point count drops below minimum
+- Tabby cats should track very well — fur patterns produce abundant texture features
+
 ### Issue: Rectangular Color Sampling Causes Misclassification
 
 **Problem (2026-02-09):**
