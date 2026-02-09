@@ -321,6 +321,85 @@ MultiCatTrackingManager: Running periodic detection (every 30 frames)
 5. **No persistence** - Tracking state lost when app is closed
 6. **No recording** - Cannot save tracked video, only live tracking
 
+## Current Issues & Alternative Approaches to Consider
+
+### Issue: OpenCV TrackerMIL Drift with Color-Based Validation
+
+**Problem (2026-02-07):**
+- TrackerMIL drifts significantly when cat moves or leaves frame
+- When tracking tabby cat near similar-colored floor, tracker drifts to floor
+- Color-based validation passes incorrectly because floor HSV values match tabby cat
+- Validation accepts low-confidence floor detections as valid cat tracking
+- Tracker continues "tracking" the floor even after cat has left the camera view
+
+**Attempted Solutions:**
+1. ✗ **Confidence threshold during validation** - Added 0.35 threshold but didn't resolve floor tracking issue
+2. ✗ **Switch to TrackerCSRT** - Not available in standard OpenCV 4.8.0 Android SDK (requires opencv_contrib modules)
+   - TrackerCSRT is in `org.opencv.tracking` package, not available in base OpenCV build
+   - Would need to either build from source with contrib or use third-party dependency like `com.quickbirdstudios:opencv-contrib`
+
+### Issue: Rectangular Color Sampling Causes Misclassification
+
+**Problem (2026-02-09):**
+- `CatColorAnalyzer` samples pixels from the inner 60% of the bounding box — still a rectangle
+- Cats are not rectangular: corners of the sampling region contain floor/background pixels
+- Black cat near tabby-colored floor gets misclassified as tabby because floor pixels in the corners have brown/orange HSV values that push `brownOrangeRatio` above the tabby threshold
+- The bottom of the bounding box is especially problematic — cat's feet/belly area includes floor
+
+**Current implementation:** `CatColorAnalyzer.kt` — samples ~400 pixels on a grid from inner 60% rect, classifies by dark pixel ratio (>60% → black) and brown/orange ratio (>20% → tabby).
+
+**Proposed solutions (in order of implementation priority):**
+
+1. **Elliptical mask + top-biased center (recommended first step)**
+   - Replace rectangular sampling with an ellipse inscribed in the bounding box — eliminates corner background pixels
+   - Shift ellipse center up by ~15% to favor cat's back/head over floor-adjacent belly/feet
+   - Check: `((x - cx)/rx)^2 + ((y - cy)/ry)^2 <= 1.0` for each sample point
+   - Combine with **median-based classification** instead of mean/ratio — median is resistant to a few remaining outlier background pixels
+   - Minimal code change, zero extra cost
+
+2. **Color clustering with background rejection (if elliptical still insufficient)**
+   - Sample pixels from full bounding box
+   - Run 2-cluster k-means on HSV values (k=2: cat vs background)
+   - Identify cat cluster by spatial proximity to bounding box center
+   - Classify color using only cat cluster pixels
+   - Handles arbitrary backgrounds by actively separating foreground/background
+   - K-means on ~400 samples is sub-millisecond
+
+3. **GrabCut segmentation (heaviest, last resort)**
+   - OpenCV `Imgproc.grabCut()` with bounding box initialization
+   - Most accurate foreground/background separation
+   - Costs ~50-100ms per call — probably overkill given detection runs periodically
+   - OpenCV already in project (for now)
+
+### Recommended Alternative: Pure Detection Approach (No OpenCV Tracking)
+
+**Key insight from requirements:** Door-opening use case accepts up to 1 second detection latency — continuous 30 FPS tracking is overkill.
+
+**Proposed approach:**
+- **Eliminate OpenCV tracking entirely** — remove `MultiCatTrackingManager`, `CatTracker`, OpenCV dependency
+- **Run MediaPipe detection every 0.5-1 second** instead of detect-once + continuous tracking
+- **Match detections frame-to-frame** using IoU + color similarity (simpler than maintaining tracker state)
+- **Define door ROI** — only trigger door when cat detected inside region of interest
+- **No tracker drift issues** — always using fresh ML inference, no accumulation of tracking errors
+
+**Why this works better:**
+1. More reliable — no drift, no floor false positives from tracker
+2. Simpler codebase — remove entire tracking subsystem
+3. Sufficient for use case — door doesn't need 30 FPS precision
+4. Better accuracy — EfficientDet-Lite0 every 0.5s beats drifted tracker
+5. No OpenCV dependency headaches — pure MediaPipe solution
+
+**Alternative frameworks to consider:**
+- **MediaPipe ObjectDetector** (already have dependency + model) — has built-in lightweight tracking if needed
+- **MLKit Object Detection** — `com.google.mlkit:object-detection:17.0.1` — simpler API, built-in tracking
+- **TensorFlow Lite Task Library** — `org.tensorflow:tensorflow-lite-task-vision` — supports existing models, has tracking
+
+**Next steps:**
+1. Complete Phase 1 (MediaPipe migration) first
+2. Test pure detection approach (every 0.5-1s) without OpenCV tracking
+3. If detection-only works well, remove OpenCV entirely from project
+4. If tracking still needed, try MediaPipe's built-in tracker or MLKit instead of OpenCV
+
 ## Roadmap
 
 Goal: reliable cat detection at a door to trigger automatic door opening. No collars. Up to ~1 second detection latency is acceptable.
@@ -426,8 +505,9 @@ Goal: reliable cat detection at a door to trigger automatic door opening. No col
 
 ---
 
-*Last Updated: 2026-02-04*
+*Last Updated: 2026-02-07*
 *Project Version: 1.1*
 *OpenCV Version: 4.8.0*
 *Current Detection Model: SSD MobileNet v1 (detect.tflite) — quantized uint8, 300x300 input*
 *Next Detection Model: EfficientDet-Lite0 via MediaPipe Tasks (efficientdet_lite0.tflite already in assets)*
+*Recommended Next Step: Consider pure detection approach (every 0.5-1s) instead of continuous OpenCV tracking*
