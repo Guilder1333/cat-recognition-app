@@ -3,7 +3,11 @@ package com.example.catrecognitionsystem.ui
 import android.graphics.Bitmap
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -27,6 +31,7 @@ import com.example.catrecognitionsystem.tracking.ValidationStatus
 import com.example.catrecognitionsystem.utils.CatColorAnalyzer
 import com.example.catrecognitionsystem.utils.MotionDetector
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -43,6 +48,15 @@ fun CatDetectionScreen(
 
     val trackingManager = remember { MultiCatTrackingManager() }
     val motionDetector = remember { MotionDetector() }
+
+    // Debug: last GrabCut mask bitmap, auto-cleared after 5s
+    var debugMaskBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    LaunchedEffect(debugMaskBitmap) {
+        if (debugMaskBitmap != null) {
+            delay(5000)
+            debugMaskBitmap = null
+        }
+    }
 
     // Master on/off for the detection loop
     var isRunning by remember { mutableStateOf(false) }
@@ -113,6 +127,7 @@ fun CatDetectionScreen(
                                                         trackedCats = trackedCats,
                                                         debugInfo = catDetector.lastDebugInfo
                                                     )
+                                                    debugMaskBitmap = CatColorAnalyzer.debugMaskBitmap
                                                     isTrackingActive = true
                                                     isDetectionInProgress = false
                                                 }
@@ -187,6 +202,33 @@ fun CatDetectionScreen(
                 CircularProgressIndicator(
                     modifier = Modifier.align(Alignment.Center)
                 )
+            }
+
+            // Debug: GrabCut mask overlay (auto-hides after 5s)
+            val mask = debugMaskBitmap
+            if (mask != null) {
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = "GrabCut mask",
+                        color = Color.White,
+                        fontSize = 10.sp,
+                        modifier = Modifier
+                            .background(Color(0xAA000000))
+                            .padding(horizontal = 4.dp, vertical = 2.dp)
+                    )
+                    Image(
+                        bitmap = mask.asImageBitmap(),
+                        contentDescription = null,
+                        modifier = Modifier
+                            .size(width = 150.dp, height = 110.dp)
+                            .border(1.dp, Color.White)
+                    )
+                }
             }
         }
 
@@ -460,8 +502,9 @@ private suspend fun processTrackingFrame(
 
         android.util.Log.d("CatDetectionScreen", "Processing tracking frame: ${bitmap.width}x${bitmap.height}, tracked cats: ${currentCats.size}")
 
-        val shouldValidate = trackingManager.shouldRunDetection() ||
-                             trackingManager.shouldRunValidation(currentCat)
+        val shouldValidate = false // TODO: re-enable after LK tracking is validated
+        // val shouldValidate = trackingManager.shouldRunDetection() ||
+        //                      trackingManager.shouldRunValidation(currentCat)
 
         if (shouldValidate) {
             android.util.Log.d("CatDetectionScreen", "Running periodic detection/validation")

@@ -372,26 +372,13 @@ MultiCatTrackingManager: Running periodic detection (every 30 frames)
 
 **Proposed solutions (in order of implementation priority):**
 
-1. **Elliptical mask + top-biased center (recommended first step)**
-   - Replace rectangular sampling with an ellipse inscribed in the bounding box — eliminates corner background pixels
-   - Shift ellipse center up by ~15% to favor cat's back/head over floor-adjacent belly/feet
-   - Check: `((x - cx)/rx)^2 + ((y - cy)/ry)^2 <= 1.0` for each sample point
-   - Combine with **median-based classification** instead of mean/ratio — median is resistant to a few remaining outlier background pixels
-   - Minimal code change, zero extra cost
-
-2. **Color clustering with background rejection (if elliptical still insufficient)**
-   - Sample pixels from full bounding box
-   - Run 2-cluster k-means on HSV values (k=2: cat vs background)
-   - Identify cat cluster by spatial proximity to bounding box center
-   - Classify color using only cat cluster pixels
-   - Handles arbitrary backgrounds by actively separating foreground/background
-   - K-means on ~400 samples is sub-millisecond
-
-3. **GrabCut segmentation (heaviest, last resort)**
-   - OpenCV `Imgproc.grabCut()` with bounding box initialization
-   - Most accurate foreground/background separation
-   - Costs ~50-100ms per call — probably overkill given detection runs periodically
-   - OpenCV already in project (for now)
+1. ~~**Elliptical mask + top-biased center**~~ — skipped, went straight to GrabCut
+2. ~~**Color clustering with background rejection**~~ — skipped
+3. **GrabCut segmentation — implemented (2026-02-11)**
+   - `CatColorAnalyzer.kt` now runs `Imgproc.grabCut()` initialized from the detection bounding box (3 iterations)
+   - Only GC_FGD and GC_PR_FGD pixels are passed to the color classifier
+   - Falls back to full-box rectangular sampling if GrabCut throws or finds < 50 foreground pixels
+   - Costs ~50-100ms per call — acceptable since color analysis only runs on detection/validation frames, not every frame
 
 ### Recommended Alternative: Pure Detection Approach (No OpenCV Tracking)
 
@@ -421,6 +408,14 @@ MultiCatTrackingManager: Running periodic detection (every 30 frames)
 2. Test pure detection approach (every 0.5-1s) without OpenCV tracking
 3. If detection-only works well, remove OpenCV entirely from project
 4. If tracking still needed, try MediaPipe's built-in tracker or MLKit instead of OpenCV
+
+## TODOs
+
+- **Re-enable periodic re-detection and validation** — temporarily disabled in `CatDetectionScreen.kt` (~line 463) to test LK tracking in isolation. Restore:
+  ```kotlin
+  val shouldValidate = trackingManager.shouldRunDetection() ||
+                       trackingManager.shouldRunValidation(currentCat)
+  ```
 
 ## Roadmap
 
