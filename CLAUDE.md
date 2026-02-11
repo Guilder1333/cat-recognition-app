@@ -8,7 +8,7 @@ Android application that detects and tracks cats using TensorFlow Lite for detec
 
 **Key Features:**
 - Cat detection using TFLite SSD MobileNet v1 (two-pass: original + flipped for better recall)
-- Continuous video tracking with OpenCV TrackerMIL
+- Continuous video tracking with Lucas-Kanade sparse optical flow (OpenCV)
 - Color-based filtering and classification (Black, Tabby, or Any)
 - Periodic validation against fresh detections with auto-stop on loss
 - Live camera overlay with bounding boxes and status indicators
@@ -73,7 +73,7 @@ if (format == android.graphics.ImageFormat.JPEG) {
 
 **Solution:** Use ImageAnalysis for BOTH initial detection and tracking:
 
-```kotlin
+```text
 Phase 1: isWaitingForFirstFrame = true
   → Enable ImageAnalysis
   → Capture first frame in callback
@@ -95,7 +95,7 @@ Phase 2: LaunchedEffect(firstFrameForTracking)
 - Windows: `setup-opencv.bat`
 - Linux/Mac: `./setup-opencv.sh`
 
-**Tracker:** Uses `TrackerMIL` (not TrackerKCF which isn't available in this version)
+**Tracker:** Uses Lucas-Kanade sparse optical flow (`Video.calcOpticalFlowPyrLK`) instead of TrackerMIL. TrackerKCF/TrackerMIL approaches caused silent drift; LK tracks individual Shi-Tomasi corner points, filters outliers, and derives the box from the remaining point cluster.
 
 **Memory Management:** Always release Mat objects explicitly:
 ```kotlin
@@ -338,9 +338,9 @@ MultiCatTrackingManager: Running periodic detection (every 30 frames)
    - TrackerCSRT is in `org.opencv.tracking` package, not available in base OpenCV build
    - Would need to either build from source with contrib or use third-party dependency like `com.quickbirdstudios:opencv-contrib`
 
-**Alternative: Sparse Optical Flow (Point Tracking) instead of TrackerMIL**
+**Implemented: Sparse Optical Flow (Point Tracking) — replaced TrackerMIL (2026-02-11)**
 
-Replace rectangle-based TrackerMIL with Lucas-Kanade sparse optical flow tracking individual feature points on the cat. All required functions are in base OpenCV 4.8.0 (no contrib needed).
+`CatTracker.kt` now uses Lucas-Kanade sparse optical flow. All required functions are in base OpenCV 4.8.0 (no contrib needed).
 
 **How it would work:**
 1. Detection finds cat → `Imgproc.goodFeaturesToTrack()` extracts ~20-30 Shi-Tomasi corners inside the bounding box
@@ -496,9 +496,9 @@ Goal: reliable cat detection at a door to trigger automatic door opening. No col
 3. Test with diverse images
 
 ### Change tracking algorithm
-1. Modify `CatTracker.kt:init()` - change from `TrackerMIL.create()`
-2. Options: TrackerMIL, TrackerCSRT (if available)
-3. Note: Not all OpenCV trackers available in Java bindings
+- `CatTracker.kt` now uses Lucas-Kanade sparse optical flow (`Video.calcOpticalFlowPyrLK`)
+- Key tuning constants: `MAX_FEATURES`, `MIN_FEATURES`, `QUALITY_LEVEL`, `MAX_TRACK_ERROR`, `OUTLIER_DISTANCE_FACTOR`
+- To revert to rectangle-based tracking, swap in a TrackerMIL-based implementation; note TrackerCSRT is not available in base OpenCV 4.8.0
 
 ### Adjust tracking frequency
 1. Change `reDetectionFrameInterval` in `MultiCatTrackingManager` constructor
